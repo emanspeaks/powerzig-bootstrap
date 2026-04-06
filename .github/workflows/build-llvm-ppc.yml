@@ -13,14 +13,12 @@ name: Build LLVM for PowerPC 32-bit
 # This workflow lives in emanspeaks/powerzig-bootstrap (not the main powerzig repo).
 #
 # Triggers:
-#   push to main  — always builds; push to this repo IS the signal something changed
-#   workflow_dispatch — manual run with explicit release tag
-#   schedule (weekly) — only builds if zig-bootstrap commit changed upstream
+#   push (any branch) — always builds for validation; releases only from main
+#   workflow_dispatch  — manual run with explicit release tag; always releases
+#   schedule (weekly)  — only builds+releases if zig-bootstrap commit changed upstream
 
 on:
   push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       release_tag:
@@ -42,13 +40,14 @@ permissions:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────────────
-  # Determine the release tag and whether a build is actually needed.
+  # Determine whether to build and whether to release.
   # ─────────────────────────────────────────────────────────────────────────────────
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      release_tag:  ${{ steps.tag.outputs.release_tag }}
-      should_build: ${{ steps.gate.outputs.should_build }}
+      release_tag:    ${{ steps.tag.outputs.release_tag }}
+      should_build:   ${{ steps.gate.outputs.should_build }}
+      should_release: ${{ steps.gate.outputs.should_release }}
     steps:
       - name: Clone zig-bootstrap from Codeberg
         run: |
@@ -57,68 +56,76 @@ jobs:
           echo "Cloned zig-bootstrap at commit: $COMMIT"
           echo "BOOTSTRAP_COMMIT=$COMMIT" >> "$GITHUB_ENV"
 
+      - name: Determine if build and release are needed
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EVENT="${{ github.event_name }}"
+          REF="${{ github.ref }}"
+          IS_MAIN="false"
+          [[ "$REF" == "refs/heads/main" ]] && IS_MAIN="true"
+
+          # push: always build; only release from main
+          if [[ "$EVENT" == "push" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "should_release=$IS_MAIN" >> "$GITHUB_OUTPUT"
+            echo "Push on $REF — build=true release=$IS_MAIN"
+            exit 0
+          fi
+
+          # dispatch: always build and release (explicit user intent)
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            FORCE="${{ inputs.force_rebuild }}"
+            TAG="${{ inputs.release_tag }}"
+            if [[ "$FORCE" != "true" ]] && gh release view "$TAG" --repo "${{ github.repository }}" &>/dev/null; then
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "Release $TAG already exists (use force_rebuild to overwrite)"
+            else
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+              echo "Dispatch — build=true release=true (tag $TAG)"
+            fi
+            exit 0
+          fi
+
+          # schedule: only build+release if zig-bootstrap commit changed
+          LATEST_RELEASE=$(gh release list --repo "${{ github.repository }}" --limit 1 \
+            --json tagName --jq '.[0].tagName // ""')
+          if [[ -n "$LATEST_RELEASE" ]]; then
+            PREV_COMMIT=$(gh release view "$LATEST_RELEASE" --repo "${{ github.repository }}" \
+              --json body --jq '.body' | grep -oP '(?<=zig-bootstrap commit: `)[^`]+' || true)
+            if [[ "$PREV_COMMIT" == "$BOOTSTRAP_COMMIT" ]]; then
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "zig-bootstrap commit $BOOTSTRAP_COMMIT unchanged since $LATEST_RELEASE — skipping"
+              exit 0
+            fi
+            echo "zig-bootstrap commit changed: $PREV_COMMIT → $BOOTSTRAP_COMMIT"
+          else
+            echo "No existing releases — first build"
+          fi
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+
       - name: Resolve release tag
         id: tag
+        if: steps.gate.outputs.should_release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             TAG="${{ inputs.release_tag }}"
-            if [[ -z "$TAG" ]]; then
-              echo "ERROR: release_tag input is required for manual runs"
-              exit 1
-            fi
           else
-            # push + schedule: auto-increment from the highest existing vN tag.
             LATEST=$(gh release list --repo "${{ github.repository }}" --limit 50 \
               --json tagName --jq '[.[].tagName | select(test("^v[0-9]+$"))] | sort_by(ltrimstr("v") | tonumber) | last // "v0"')
             N=$(echo "$LATEST" | grep -oE '[0-9]+')
             TAG="v$((N + 1))"
-            echo "Auto-increment — next tag will be $TAG (latest was $LATEST)"
+            echo "Auto-increment — next tag: $TAG (latest was $LATEST)"
           fi
           echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Release tag: $TAG"
-
-      - name: Determine if build is needed
-        id: gate
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ steps.tag.outputs.release_tag }}"
-          FORCE="${{ inputs.force_rebuild }}"
-          EVENT="${{ github.event_name }}"
-
-          # push: always build — a commit to this repo IS the signal something changed
-          # (workflow patches, cross-compilation config, etc.)
-          if [[ "$EVENT" == "push" ]]; then
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "Push event — always building as $TAG"
-            exit 0
-          fi
-
-          # schedule: only build if zig-bootstrap commit differs from the last release
-          if [[ "$EVENT" == "schedule" ]]; then
-            LATEST_RELEASE=$(gh release list --repo "${{ github.repository }}" --limit 1 \
-              --json tagName --jq '.[0].tagName // ""')
-            if [[ -n "$LATEST_RELEASE" ]]; then
-              PREV_COMMIT=$(gh release view "$LATEST_RELEASE" --repo "${{ github.repository }}" \
-                --json body --jq '.body' | grep -oP '(?<=zig-bootstrap commit: `)[^`]+' || true)
-              if [[ "$PREV_COMMIT" == "$BOOTSTRAP_COMMIT" ]]; then
-                echo "should_build=false" >> "$GITHUB_OUTPUT"
-                echo "zig-bootstrap commit $BOOTSTRAP_COMMIT unchanged since $LATEST_RELEASE — skipping"
-                exit 0
-              fi
-            fi
-          fi
-
-          # workflow_dispatch: build unless release already exists (respect force_rebuild)
-          if [[ "$FORCE" != "true" ]] && gh release view "$TAG" --repo "${{ github.repository }}" &>/dev/null; then
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-            echo "Release $TAG already exists (use force_rebuild to overwrite)"
-          else
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "Will build and publish as $TAG"
-          fi
 
   # ─────────────────────────────────────────────────────────────────────────────────
   # Build host LLVM + host Zig + cross LLVM for powerpc-linux-musleabihf.
@@ -196,7 +203,7 @@ jobs:
 
       - name: Build host LLVM + host Zig + cross LLVM
         run: |
-          echo "=== Building LLVM artifact $RELEASE_TAG ==="
+          echo "=== Building LLVM artifact ==="
           echo "zig-bootstrap commit: $BOOTSTRAP_COMMIT"
           echo "Zig version: $ZIG_VERSION"
           echo "Target: $ZIG_TARGET  CPU: $ZIG_CPU"
@@ -221,22 +228,17 @@ jobs:
 
       - name: Package LLVM artifacts
         run: |
-          # Host artifact: only the host Zig binary (the rest of out/host/ is large
-          # and not needed by the downstream Zig build).
           mkdir -p host-artifact/bin
           cp bootstrap/out/host/bin/zig host-artifact/bin/zig
           tar -cJf llvm-host-zig.tar.xz -C host-artifact .
 
-          # Cross artifact: full cross-LLVM install prefix.
-          # Contains cross LLVM/Clang/LLD static libs, zlib, zstd, and cmake configs.
-          # The downstream Zig build uses --search-prefix pointing here.
           tar -cJf llvm-cross-powerpc32.tar.xz \
               -C bootstrap/out "$ZIG_TARGET-$ZIG_CPU"
 
           ls -lah llvm-host-zig.tar.xz llvm-cross-powerpc32.tar.xz
 
       - name: Delete existing release (force-rebuild only)
-        if: inputs.force_rebuild == 'true'
+        if: needs.prepare.outputs.should_release == 'true' && inputs.force_rebuild == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -246,6 +248,7 @@ jobs:
             --yes 2>/dev/null || true
 
       - name: Publish LLVM Release
+        if: needs.prepare.outputs.should_release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
