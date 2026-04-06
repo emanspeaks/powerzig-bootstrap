@@ -114,7 +114,7 @@ jobs:
               echo "zig-bootstrap commit $BOOTSTRAP_COMMIT unchanged since $LATEST_RELEASE — skipping"
               exit 0
             fi
-            echo "zig-bootstrap commit changed: $PREV_COMMIT \u2192 $BOOTSTRAP_COMMIT"
+            echo "zig-bootstrap commit changed: $PREV_COMMIT → $BOOTSTRAP_COMMIT"
           else
             echo "No existing releases — first build"
           fi
@@ -154,8 +154,12 @@ jobs:
       ZIG_VERSION:      ${{ needs.prepare.outputs.zig_version }}
       ZIG_TARGET:       powerpc-linux-musleabihf
       ZIG_CPU:          baseline
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Restore build cache
         id: cache
         uses: actions/cache/restore@v4
@@ -264,23 +268,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          printf '%s\n' \
-            "Pre-built LLVM artifacts consumed by [emanspeaks/powerzig](https://github.com/emanspeaks/powerzig)'s Zig build workflow." \
-            "" \
-            "| Field | Value |" \
-            "|---|---|" \
-            "| Release tag | \`$RELEASE_TAG\` |" \
-            "| zig-bootstrap commit | \`$BOOTSTRAP_COMMIT\` |" \
-            "| Zig version in zig-bootstrap | \`$ZIG_VERSION\` |" \
-            "| Target | \`$ZIG_TARGET\` |" \
-            "| CPU | \`$ZIG_CPU\` |" \
-            "| Host LLVM build type | MinSizeRel (build-time tool only) |" \
-            "| Cross LLVM build type | Release (linked into the final Zig binary) |" \
-            "" \
-            "**Files:**" \
-            "- \`llvm-host-zig.tar.xz\` \u2014 host Zig compiler (\`out/host/bin/zig\`), used to compile the cross Zig" \
-            "- \`llvm-cross-powerpc32.tar.xz\` \u2014 cross LLVM install prefix, statically linked into the final Zig binary" \
-            > /tmp/release-notes.md
+          envsubst < .github/release-notes/llvm-template.md > /tmp/release-notes.md
           gh release create "$RELEASE_TAG" \
             --repo "${{ github.repository }}" \
             --title "LLVM for PowerPC 32-bit $RELEASE_TAG" \
