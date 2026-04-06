@@ -10,12 +10,16 @@ name: Build LLVM for PowerPC 32-bit
 # powerzig repo's build-ppc.yml to match.  That version bump is what triggers a
 # Zig rebuild — no automatic detection needed.
 #
-# This workflow lives in emanspeaks/powerzig-bootstrap (not the main powerzig repo).
-#
 # Triggers:
 #   push (any branch) — always builds for validation; releases only from main
 #   workflow_dispatch  — manual run with explicit release tag; always releases
 #   schedule (weekly)  — only builds+releases if zig-bootstrap commit changed upstream
+#
+# Caching:
+#   Packaged archives (llvm-host-zig.tar.xz + llvm-cross-powerpc32.tar.xz) are
+#   cached keyed on the zig-bootstrap commit hash.  After a feature branch run
+#   succeeds, merging to main hits the cache and skips the 3-4 hour build,
+#   going straight to publish.
 
 on:
   push:
@@ -31,8 +35,6 @@ on:
         required: false
         default: false
   schedule:
-    # Weekly check: only builds if the pinned zig-bootstrap commit changed since
-    # the last tagged release. See the "Determine if build is needed" step.
     - cron: '0 3 * * 0'   # Every Sunday at 03:00 UTC
 
 permissions:
@@ -40,33 +42,44 @@ permissions:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────────────
-  # Determine whether to build and whether to release.
+  # Resolve bootstrap commit, decide whether to build and/or release.
   # ─────────────────────────────────────────────────────────────────────────────────
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      release_tag:    ${{ steps.tag.outputs.release_tag }}
-      should_build:   ${{ steps.gate.outputs.should_build }}
-      should_release: ${{ steps.gate.outputs.should_release }}
+      release_tag:      ${{ steps.tag.outputs.release_tag }}
+      should_build:     ${{ steps.gate.outputs.should_build }}
+      should_release:   ${{ steps.gate.outputs.should_release }}
+      bootstrap_commit: ${{ steps.clone.outputs.bootstrap_commit }}
+      zig_version:      ${{ steps.clone.outputs.zig_version }}
     steps:
       - name: Clone zig-bootstrap from Codeberg
+        id: clone
         run: |
           git clone --depth 1 https://codeberg.org/ziglang/zig-bootstrap.git bootstrap
           COMMIT=$(git -C bootstrap rev-parse --short HEAD)
+          echo "bootstrap_commit=$COMMIT" >> "$GITHUB_OUTPUT"
           echo "Cloned zig-bootstrap at commit: $COMMIT"
-          echo "BOOTSTRAP_COMMIT=$COMMIT" >> "$GITHUB_ENV"
+          cd bootstrap
+          if [[ -f zig-version ]]; then
+            ZV=$(tr -d '[:space:]' < zig-version)
+          else
+            ZV=$(grep -m1 'ZIG_VERSION' build | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^"'\''[:space:]]*' || echo "unknown")
+          fi
+          echo "zig_version=$ZV" >> "$GITHUB_OUTPUT"
+          echo "Zig version: $ZV"
 
       - name: Determine if build and release are needed
         id: gate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BOOTSTRAP_COMMIT: ${{ steps.clone.outputs.bootstrap_commit }}
         run: |
           EVENT="${{ github.event_name }}"
           REF="${{ github.ref }}"
           IS_MAIN="false"
           [[ "$REF" == "refs/heads/main" ]] && IS_MAIN="true"
 
-          # push: always build; only release from main
           if [[ "$EVENT" == "push" ]]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
             echo "should_release=$IS_MAIN" >> "$GITHUB_OUTPUT"
@@ -74,7 +87,6 @@ jobs:
             exit 0
           fi
 
-          # dispatch: always build and release (explicit user intent)
           if [[ "$EVENT" == "workflow_dispatch" ]]; then
             FORCE="${{ inputs.force_rebuild }}"
             TAG="${{ inputs.release_tag }}"
@@ -128,9 +140,7 @@ jobs:
           echo "Release tag: $TAG"
 
   # ─────────────────────────────────────────────────────────────────────────────────
-  # Build host LLVM + host Zig + cross LLVM for powerpc-linux-musleabihf.
-  # The build exits after the cross-LLVM cmake install (before cross-Zig);
-  # building Zig is the downstream powerzig repo's responsibility.
+  # Build host LLVM + host Zig + cross LLVM, cache results, publish if releasing.
   # ─────────────────────────────────────────────────────────────────────────────────
   build:
     needs: prepare
@@ -139,12 +149,24 @@ jobs:
     timeout-minutes: 360   # 6-hour hard cap
 
     env:
-      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
-      ZIG_TARGET:  powerpc-linux-musleabihf
-      ZIG_CPU:     baseline
+      RELEASE_TAG:      ${{ needs.prepare.outputs.release_tag }}
+      BOOTSTRAP_COMMIT: ${{ needs.prepare.outputs.bootstrap_commit }}
+      ZIG_VERSION:      ${{ needs.prepare.outputs.zig_version }}
+      ZIG_TARGET:       powerpc-linux-musleabihf
+      ZIG_CPU:          baseline
 
     steps:
+      - name: Restore build cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            llvm-host-zig.tar.xz
+            llvm-cross-powerpc32.tar.xz
+          key: llvm-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
+
       - name: Free up runner disk space
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sudo rm -rf \
             /usr/share/dotnet \
@@ -163,31 +185,17 @@ jobs:
           df -h
 
       - name: Install build dependencies
-        run: |
-          sudo apt-get install -y -qq cmake ninja-build xz-utils python3
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: sudo apt-get install -y -qq cmake ninja-build xz-utils python3
 
       - name: Clone zig-bootstrap from Codeberg
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 https://codeberg.org/ziglang/zig-bootstrap.git bootstrap
-          COMMIT=$(git -C bootstrap rev-parse --short HEAD)
-          echo "Cloned at commit: $COMMIT"
-          echo "BOOTSTRAP_COMMIT=$COMMIT" >> "$GITHUB_ENV"
-          # Also capture the Zig version for the release notes
-          cd bootstrap
-          if [[ -f zig-version ]]; then
-            ZV=$(tr -d '[:space:]' < zig-version)
-          else
-            ZV=$(grep -m1 'ZIG_VERSION' build | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^"'\''[:space:]]*' || echo "unknown")
-          fi
-          echo "ZIG_VERSION=$ZV" >> "$GITHUB_ENV"
-          echo "Zig version in this zig-bootstrap: $ZV"
+          echo "Cloned at commit: $BOOTSTRAP_COMMIT"
 
-      # Patches applied here:
-      # 1. Delete intermediate cmake build dirs after each install (disk space)
-      # 2. MinSizeRel for host LLVM + host Zig (build-time tools only); cross-LLVM
-      #    stays Release so the final PowerPC Zig binary has fast LLVM internals
-      # 3. exit 0 after cross-LLVM install — building cross Zig is not our job
       - name: Patch zig-bootstrap build script
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sed -i '/# Now we build Zig, still with system/i rm -rf "$ROOTDIR/out/build-llvm-host"' bootstrap/build
           sed -i '/# Now we have Zig as a cross compiler/i rm -rf "$ROOTDIR/out/build-zig-host"' bootstrap/build
@@ -198,27 +206,24 @@ jobs:
           sed -i '/# Finally, we can cross compile Zig itself/a exit 0' bootstrap/build
           echo "=== Verified patches ==="
           grep -n 'rm -rf\|CMAKE_BUILD_TYPE\|exit 0' bootstrap/build
-          echo "=== Disk before build ==="
           df -h
 
       - name: Build host LLVM + host Zig + cross LLVM
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          echo "=== Building LLVM artifact ==="
-          echo "zig-bootstrap commit: $BOOTSTRAP_COMMIT"
-          echo "Zig version: $ZIG_VERSION"
-          echo "Target: $ZIG_TARGET  CPU: $ZIG_CPU"
+          echo "Target: $ZIG_TARGET  CPU: $ZIG_CPU  Bootstrap: $BOOTSTRAP_COMMIT"
           cd bootstrap
           ./build "$ZIG_TARGET" "$ZIG_CPU"
-          echo "=== Disk after build ==="
           df -h
 
       - name: Verify LLVM build outputs
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           HOST_ZIG="bootstrap/out/host/bin/zig"
           CROSS_CMAKE="bootstrap/out/$ZIG_TARGET-$ZIG_CPU/lib/cmake/llvm/LLVMConfig.cmake"
           ok=true
-          [[ ! -f "$HOST_ZIG" ]]    && echo "ERROR: host Zig binary missing"           && ok=false
-          [[ ! -f "$CROSS_CMAKE" ]] && echo "ERROR: cross LLVM cmake config missing"   && ok=false
+          [[ ! -f "$HOST_ZIG" ]]    && echo "ERROR: host Zig binary missing"         && ok=false
+          [[ ! -f "$CROSS_CMAKE" ]] && echo "ERROR: cross LLVM cmake config missing" && ok=false
           if [[ "$ok" == "false" ]]; then
             find bootstrap/out -maxdepth 4 | sort
             exit 1
@@ -227,15 +232,22 @@ jobs:
           echo "Cross LLVM: $(ls bootstrap/out/$ZIG_TARGET-$ZIG_CPU/lib/*.a 2>/dev/null | wc -l) static libs"
 
       - name: Package LLVM artifacts
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p host-artifact/bin
           cp bootstrap/out/host/bin/zig host-artifact/bin/zig
           tar -cJf llvm-host-zig.tar.xz -C host-artifact .
-
-          tar -cJf llvm-cross-powerpc32.tar.xz \
-              -C bootstrap/out "$ZIG_TARGET-$ZIG_CPU"
-
+          tar -cJf llvm-cross-powerpc32.tar.xz -C bootstrap/out "$ZIG_TARGET-$ZIG_CPU"
           ls -lah llvm-host-zig.tar.xz llvm-cross-powerpc32.tar.xz
+
+      - name: Save build cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            llvm-host-zig.tar.xz
+            llvm-cross-powerpc32.tar.xz
+          key: llvm-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
 
       - name: Delete existing release (force-rebuild only)
         if: needs.prepare.outputs.should_release == 'true' && inputs.force_rebuild == 'true'
@@ -258,8 +270,6 @@ jobs:
             --title "LLVM for PowerPC 32-bit $RELEASE_TAG" \
             --notes "$(cat <<NOTES
 Pre-built LLVM artifacts consumed by [emanspeaks/powerzig](https://github.com/emanspeaks/powerzig)'s Zig build workflow.
-
-To use this release, set \`LLVM_ARTIFACT_TAG: $RELEASE_TAG\` in [build-ppc.yml](https://github.com/emanspeaks/powerzig/blob/main/.github/workflows/build-ppc.yml).
 
 | Field | Value |
 |---|---|
