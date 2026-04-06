@@ -161,7 +161,7 @@ jobs:
         id: cache
         uses: actions/cache/restore@v4
         with:
-          path: llvm-host-zig.tar.xz
+          path: llvm-host-tools.tar.xz
           key: llvm-host-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
 
       - name: Free up runner disk space
@@ -199,12 +199,12 @@ jobs:
           # Use MinSizeRel for host LLVM and host Zig (build-time tools only)
           sed -i '0,/-DCMAKE_BUILD_TYPE=Release/{s/-DCMAKE_BUILD_TYPE=Release/-DCMAKE_BUILD_TYPE=MinSizeRel/}' bootstrap/build
           sed -i '0,/-DCMAKE_BUILD_TYPE=Release/{s/-DCMAKE_BUILD_TYPE=Release/-DCMAKE_BUILD_TYPE=MinSizeRel/}' bootstrap/build
-          # Free disk: remove host LLVM build dir before building host Zig
-          sed -i '/# Now we build Zig, still with system/i rm -rf "$ROOTDIR/out/build-llvm-host"' bootstrap/build
+          # NOTE: do NOT remove out/build-llvm-host — clang-tblgen lives there and
+          # is required by the cross LLVM cmake (CLANG_TABLEGEN=.../build-llvm-host/bin/clang-tblgen)
           # Stop before cross LLVM build
           sed -i '/# Now we have Zig as a cross compiler/i exit 0' bootstrap/build
           echo "=== Verified patches ==="
-          grep -n 'MinSizeRel\|rm -rf\|exit 0' bootstrap/build
+          grep -n 'MinSizeRel\|exit 0' bootstrap/build
           df -h
 
       - name: Build host LLVM + host Zig
@@ -215,29 +215,46 @@ jobs:
           ./build "$ZIG_TARGET" "$ZIG_CPU"
           df -h
 
-      - name: Verify and package host Zig
+      - name: Package host tools
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           HOST_ZIG="bootstrap/out/host/bin/zig"
+          CLANG_TBLGEN="bootstrap/out/build-llvm-host/bin/clang-tblgen"
           [[ ! -f "$HOST_ZIG" ]] && echo "ERROR: host Zig binary missing" && exit 1
+          [[ ! -f "$CLANG_TBLGEN" ]] && echo "ERROR: clang-tblgen missing (needed for cross LLVM cmake)" && exit 1
           echo "Host Zig: $(file $HOST_ZIG)"
-          mkdir -p host-artifact/bin
-          cp "$HOST_ZIG" host-artifact/bin/zig
-          tar -cJf llvm-host-zig.tar.xz -C host-artifact .
-          ls -lah llvm-host-zig.tar.xz
+
+          # Package all binaries the cross LLVM cmake needs:
+          #   out/host/bin/{zig,llvm-tblgen,llvm-ar,llvm-ranlib,llvm-rc}
+          #   out/build-llvm-host/bin/clang-tblgen
+          mkdir -p host-tools/host/bin host-tools/build-llvm-host/bin
+          for tool in zig llvm-tblgen llvm-ar llvm-ranlib llvm-rc; do
+            src="bootstrap/out/host/bin/$tool"
+            if [[ -f "$src" ]]; then
+              cp "$src" host-tools/host/bin/
+              echo "  included: $tool ($(du -sh $src | cut -f1))"
+            else
+              echo "  warning: $tool not found in out/host/bin/"
+            fi
+          done
+          cp "$CLANG_TBLGEN" host-tools/build-llvm-host/bin/
+          echo "  included: clang-tblgen ($(du -sh $CLANG_TBLGEN | cut -f1))"
+
+          tar -cJf llvm-host-tools.tar.xz -C host-tools .
+          ls -lah llvm-host-tools.tar.xz
 
       - name: Save host build cache
         if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: llvm-host-zig.tar.xz
+          path: llvm-host-tools.tar.xz
           key: llvm-host-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
 
       - name: Upload host artifact for cross build
         uses: actions/upload-artifact@v4
         with:
-          name: llvm-host-zig
-          path: llvm-host-zig.tar.xz
+          name: llvm-host-tools
+          path: llvm-host-tools.tar.xz
           retention-days: 1
 
   # ───────────────────────────────────────────────────────────────────────────────
@@ -297,7 +314,7 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/download-artifact@v4
         with:
-          name: llvm-host-zig
+          name: llvm-host-tools
 
       - name: Clone zig-bootstrap from Codeberg
         if: steps.cache.outputs.cache-hit != 'true'
@@ -305,13 +322,20 @@ jobs:
           git clone --depth 1 https://codeberg.org/ziglang/zig-bootstrap.git bootstrap
           echo "Cloned at commit: $BOOTSTRAP_COMMIT"
 
-      - name: Extract host Zig into bootstrap tree
+      - name: Extract host tools into bootstrap tree
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          mkdir -p bootstrap/out/host
-          tar -xJf llvm-host-zig.tar.xz -C bootstrap/out/host
+          # Artifact layout: host/bin/{zig,llvm-tblgen,...} and build-llvm-host/bin/clang-tblgen
+          mkdir -p bootstrap/out
+          tar -xJf llvm-host-tools.tar.xz -C bootstrap/out
           chmod +x bootstrap/out/host/bin/zig
+          chmod +x bootstrap/out/host/bin/llvm-tblgen 2>/dev/null || true
+          chmod +x bootstrap/out/host/bin/llvm-ar 2>/dev/null || true
+          chmod +x bootstrap/out/host/bin/llvm-ranlib 2>/dev/null || true
+          chmod +x bootstrap/out/host/bin/llvm-rc 2>/dev/null || true
+          chmod +x bootstrap/out/build-llvm-host/bin/clang-tblgen
           echo "Host Zig: $(bootstrap/out/host/bin/zig version)"
+          echo "Tools present: $(ls bootstrap/out/host/bin/ bootstrap/out/build-llvm-host/bin/)"
 
       - name: Patch for cross-only build
         if: steps.cache.outputs.cache-hit != 'true'
@@ -344,7 +368,11 @@ jobs:
       - name: Package LLVM artifacts
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          # llvm-host-zig.tar.xz already present from artifact download
+          # Release artifact: just zig binary (powerzig only needs this)
+          mkdir -p release-host/bin
+          cp bootstrap/out/host/bin/zig release-host/bin/zig
+          tar -cJf llvm-host-zig.tar.xz -C release-host .
+          # Cross LLVM install prefix
           tar -cJf llvm-cross-powerpc32.tar.xz -C bootstrap/out "$ZIG_TARGET-$ZIG_CPU"
           ls -lah llvm-host-zig.tar.xz llvm-cross-powerpc32.tar.xz
 
