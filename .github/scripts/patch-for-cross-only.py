@@ -12,7 +12,7 @@ if first_cmake is None or cross_marker is None:
     print(f"ERROR: Could not find patch markers (first_cmake={first_cmake}, cross_marker={cross_marker})", file=sys.stderr)
     sys.exit(1)
 
-lines.insert(first_cmake, 'if [[ ! -f "$ROOTDIR/out/host/bin/zig" ]]; then\n')
+lines.insert(first_cmake, 'if [ ! -f "$ROOTDIR/out/host/bin/zig" ]; then\n')
 lines.insert(cross_marker + 1, 'fi\n')
 
 script_path.write_text(''.join(lines))
