@@ -199,12 +199,15 @@ jobs:
           # Use MinSizeRel for host LLVM and host Zig (build-time tools only)
           sed -i '0,/-DCMAKE_BUILD_TYPE=Release/{s/-DCMAKE_BUILD_TYPE=Release/-DCMAKE_BUILD_TYPE=MinSizeRel/}' bootstrap/build
           sed -i '0,/-DCMAKE_BUILD_TYPE=Release/{s/-DCMAKE_BUILD_TYPE=Release/-DCMAKE_BUILD_TYPE=MinSizeRel/}' bootstrap/build
+          # Limit host LLVM to PowerPC target only — we only need it to emit powerpc code
+          # when zig cc cross-compiles the cross LLVM in the next job. Cuts build time dramatically.
+          sed -i '0,/-DCLANG_TOOL_LIBCLANG_BUILD=OFF/{s/-DCLANG_TOOL_LIBCLANG_BUILD=OFF/-DCLANG_TOOL_LIBCLANG_BUILD=OFF \\\n    -DLLVM_TARGETS_TO_BUILD=PowerPC/}' bootstrap/build
           # NOTE: do NOT remove out/build-llvm-host — clang-tblgen lives there and
           # is required by the cross LLVM cmake (CLANG_TABLEGEN=.../build-llvm-host/bin/clang-tblgen)
           # Stop before cross LLVM build
           sed -i '/# Now we have Zig as a cross compiler/i exit 0' bootstrap/build
           echo "=== Verified patches ==="
-          grep -n 'MinSizeRel\|exit 0' bootstrap/build
+          grep -n 'MinSizeRel\|TARGETS_TO_BUILD\|exit 0' bootstrap/build
           df -h
 
       - name: Build host LLVM + host Zig
@@ -347,13 +350,13 @@ jobs:
         run: |
           # Skip host LLVM + host Zig stages (host zig already provided)
           python3 .github/scripts/patch-for-cross-only.py bootstrap/build
-          # Free disk: remove cross LLVM build dir and sources before cross Zig stage
-          sed -i '/# Finally, we can cross compile Zig itself/i rm -rf "$ROOTDIR/out/build-llvm-$TARGET-$MCPU"' bootstrap/build
-          sed -i '/# Finally, we can cross compile Zig itself/i rm -rf "$ROOTDIR/llvm" "$ROOTDIR/zlib" "$ROOTDIR/zstd"' bootstrap/build
+          # Limit cross LLVM to PowerPC target only — the resulting Zig runs on and compiles
+          # for powerpc. Building all ~25 LLVM backends takes >6 hours; just PowerPC is fast.
+          sed -i 's/-DLLD_BUILD_TOOLS=OFF/-DLLD_BUILD_TOOLS=OFF \\\n    -DLLVM_TARGETS_TO_BUILD=PowerPC/' bootstrap/build
           # Stop before cross Zig (we build Zig separately in powerzig repo)
           sed -i '/# Finally, we can cross compile Zig itself/a exit 0' bootstrap/build
           echo "=== Verified patches ==="
-          grep -n 'if \[\[.*host/bin/zig\|^fi$\|rm -rf\|exit 0' bootstrap/build || true
+          grep -n 'TARGETS_TO_BUILD\|exit 0' bootstrap/build || true
 
       - name: Build cross LLVM
         if: steps.cache.outputs.cache-hit != 'true'
