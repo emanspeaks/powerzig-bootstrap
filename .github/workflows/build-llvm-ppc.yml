@@ -353,10 +353,13 @@ jobs:
           # Limit cross LLVM to PowerPC target only — the resulting Zig runs on and compiles
           # for powerpc. Building all ~25 LLVM backends takes >6 hours; just PowerPC is fast.
           sed -i 's/-DLLD_BUILD_TOOLS=OFF/-DLLD_BUILD_TOOLS=OFF \\\n    -DLLVM_TARGETS_TO_BUILD=PowerPC/' bootstrap/build
+          # Use MinSizeRel (-Os) instead of Release (-O3) for cross LLVM. Acceptable for a
+          # bootstrap compiler; trades a small runtime perf hit for ~30% faster compilation.
+          sed -i '/# Rebuild LLVM with Zig/,/cmake --build/{s/-DCMAKE_BUILD_TYPE=Release/-DCMAKE_BUILD_TYPE=MinSizeRel/}' bootstrap/build
           # Stop before cross Zig (we build Zig separately in powerzig repo)
           sed -i '/# Finally, we can cross compile Zig itself/a exit 0' bootstrap/build
           echo "=== Verified patches ==="
-          grep -n 'TARGETS_TO_BUILD\|exit 0' bootstrap/build || true
+          grep -n 'TARGETS_TO_BUILD\|BUILD_TYPE\|exit 0' bootstrap/build || true
 
       - name: Build cross LLVM
         if: steps.cache.outputs.cache-hit != 'true'
