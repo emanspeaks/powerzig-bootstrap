@@ -276,6 +276,7 @@ jobs:
       ZIG_TARGET:       powerpc-linux-musleabihf
       ZIG_CPU:          baseline
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      CCACHE_DIR:       ${{ github.workspace }}/.ccache
 
     steps:
       - name: Checkout repository
@@ -311,7 +312,24 @@ jobs:
 
       - name: Install build dependencies
         if: steps.cache.outputs.cache-hit != 'true'
-        run: sudo apt-get install -y -qq cmake ninja-build xz-utils python3
+        run: sudo apt-get install -y -qq cmake ninja-build xz-utils python3 ccache
+
+      - name: Restore ccache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-
+
+      - name: Configure ccache
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          ccache --set-config=max_size=8G
+          ccache --set-config=compression=true
+          ccache -z
+          echo "ccache dir: $CCACHE_DIR"
 
       - name: Download host artifact
         if: steps.cache.outputs.cache-hit != 'true'
@@ -353,13 +371,13 @@ jobs:
           # Limit cross LLVM to PowerPC target only — the resulting Zig runs on and compiles
           # for powerpc. Building all ~25 LLVM backends takes >6 hours; just PowerPC is fast.
           sed -i 's/-DLLD_BUILD_TOOLS=OFF/-DLLD_BUILD_TOOLS=OFF \\\n    -DLLVM_TARGETS_TO_BUILD=PowerPC/' bootstrap/build
-          # Use MinSizeRel (-Os) instead of Release (-O3) for cross LLVM. Acceptable for a
-          # bootstrap compiler; trades a small runtime perf hit for ~30% faster compilation.
-          sed -i '/# Rebuild LLVM with Zig/,/cmake --build/{s/-DCMAKE_BUILD_TYPE=Release/-DCMAKE_BUILD_TYPE=MinSizeRel/}' bootstrap/build
+          # Wire ccache into the cross LLVM cmake so compiled objects are cached between runs.
+          # If the build times out, the next attempt restores the ccache and skips already-done work.
+          sed -i '/# Rebuild LLVM with Zig/,/cmake --build/{s/-DLLVM_TARGETS_TO_BUILD=PowerPC/-DLLVM_TARGETS_TO_BUILD=PowerPC \\\n    -DCMAKE_C_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_ASM_COMPILER_LAUNCHER=ccache/}' bootstrap/build
           # Stop before cross Zig (we build Zig separately in powerzig repo)
           sed -i '/# Finally, we can cross compile Zig itself/a exit 0' bootstrap/build
           echo "=== Verified patches ==="
-          grep -n 'TARGETS_TO_BUILD\|BUILD_TYPE\|exit 0' bootstrap/build || true
+          grep -n 'TARGETS_TO_BUILD\|COMPILER_LAUNCHER\|exit 0' bootstrap/build || true
 
       - name: Build cross LLVM
         if: steps.cache.outputs.cache-hit != 'true'
@@ -368,6 +386,17 @@ jobs:
           cd bootstrap
           ./build "$ZIG_TARGET" "$ZIG_CPU"
           df -h
+
+      - name: ccache stats
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        run: ccache -s
+
+      - name: Save ccache
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Verify cross LLVM build
         if: steps.cache.outputs.cache-hit != 'true'
