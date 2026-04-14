@@ -4,9 +4,9 @@ name: Build LLVM for PowerPC 32-bit
 # zig-bootstrap, and publishes the result as a GitHub Release.
 #
 # The build is split into three jobs to stay under GitHub's 6-hour per-job limit:
-#   build-host         — host LLVM + host Zig
-#   build-cross-llvm   — cross LLVM core only (no clang/lld), saves ccache
-#   build-cross-clang-lld — clang + lld with warm ccache, cmake install, publish
+#   build-host        — host LLVM + host Zig
+#   build-cross-llvm  — cross LLVM+clang+lld compile only (5h), saves ccache on exit
+#   build-cross-clang-lld — restores ccache (all objects cached), cmake install, publish
 #
 # Releases use this repo's own sequential versioning (v1, v2, …), independent of
 # upstream Zig or LLVM version numbers.
@@ -263,9 +263,8 @@ jobs:
           retention-days: 1
 
   # ───────────────────────────────────────────────────────────────────────────────
-  # Job 2a: Compile LLVM core only (no clang, no lld).
-  # This is ~60% of cross-compilation work. Saving the ccache lets Job 2b start
-  # clang+lld with all LLVM objects already cached — avoiding the 6-hour hard kill.
+  # Job 2a: Compile cross LLVM + clang + lld (5-hour limit, no cmake install).
+  # Saves ccache before the 6-hour hard kill so Job 2b can resume with a warm cache.
   # ───────────────────────────────────────────────────────────────────────────────
   build-cross-llvm:
     needs: [prepare, build-host]
@@ -363,26 +362,23 @@ jobs:
           ln -s "$(pwd)/bootstrap/zig/lib" bootstrap/out/host/lib/zig
           echo "Host Zig: $(bootstrap/out/host/bin/zig version)"
 
-      - name: Patch for LLVM-core-only cross build
+      - name: Patch for compile-only cross build
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           # Skip host LLVM + host Zig stages (host zig already provided)
           python3 .github/scripts/patch-for-cross-only.py bootstrap/build
           # Limit cross LLVM to PowerPC target only
           sed -i 's/-DLLD_BUILD_TOOLS=OFF/-DLLD_BUILD_TOOLS=OFF \\\n    -DLLVM_TARGETS_TO_BUILD=PowerPC/' bootstrap/build
-          # Wire ccache into the cross LLVM cmake
+          # Wire ccache into the cross LLVM cmake so compiled objects survive the job boundary
           sed -i '/# Rebuild LLVM with Zig/,/cmake --build/{s/-DLLVM_TARGETS_TO_BUILD=PowerPC/-DLLVM_TARGETS_TO_BUILD=PowerPC \\\n    -DCMAKE_C_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_ASM_COMPILER_LAUNCHER=ccache/}' bootstrap/build
-          # LLVM-only: disable clang and lld for this phase.
-          # Job 2b re-enables them; all LLVM .o files will be ccache hits.
-          sed -i 's/-DLLVM_ENABLE_PROJECTS="[^"]*"/-DLLVM_ENABLE_PROJECTS=""/' bootstrap/build
-          # Compile-only: strip --target install
+          # Compile-only: strip --target install. Job 2b restores ccache and runs install.
           sed -i 's/cmake --build \. --target install/cmake --build ./' bootstrap/build
           # Stop before cross Zig (we build Zig separately in powerzig repo)
           sed -i '/# Finally, we can cross compile Zig itself/a exit 0' bootstrap/build
           echo "=== Verified patches ==="
-          grep -n 'TARGETS_TO_BUILD\|COMPILER_LAUNCHER\|ENABLE_PROJECTS\|exit 0\|--target install' bootstrap/build || true
+          grep -n 'TARGETS_TO_BUILD\|COMPILER_LAUNCHER\|exit 0\|--target install' bootstrap/build || true
 
-      - name: Compile LLVM core only (no clang/lld)
+      - name: Compile cross LLVM + clang + lld (no install)
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           echo "Target: $ZIG_TARGET  CPU: $ZIG_CPU  Bootstrap: $BOOTSTRAP_COMMIT"
@@ -402,9 +398,9 @@ jobs:
           key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
 
   # ───────────────────────────────────────────────────────────────────────────────
-  # Job 2b: Compile clang + lld, then install, package and publish.
-  # Restores Job 2a's ccache so all LLVM objects are cache hits — only clang and
-  # lld need to be freshly compiled. Runs even if Job 2a timed out.
+  # Job 2b: Complete the cross build — install, package and publish.
+  # Restores Job 2a's ccache; all already-compiled objects are cache hits so only
+  # linking + cmake install remains. Runs even if Job 2a timed out.
   # ───────────────────────────────────────────────────────────────────────────────
   build-cross-clang-lld:
     needs: [prepare, build-host, build-cross-llvm]
