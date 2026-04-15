@@ -213,10 +213,15 @@ jobs:
           sed -i '0,/-DCLANG_TOOL_LIBCLANG_BUILD=OFF/{s/-DCLANG_TOOL_LIBCLANG_BUILD=OFF/-DCLANG_TOOL_LIBCLANG_BUILD=OFF \\\n    -DLLVM_TARGETS_TO_BUILD=PowerPC/}' bootstrap/build
           # NOTE: do NOT remove out/build-llvm-host — clang-tblgen lives there and
           # is required by the cross LLVM cmake (CLANG_TABLEGEN=.../build-llvm-host/bin/clang-tblgen)
+          # Force Unix Makefiles (make -j1) for the host Zig cmake build. Ninja default runs
+          # the two zig1 WASM interpreter invocations (zig2.c + compiler_rt.c generation)
+          # simultaneously since both depend only on zig1 — each uses 1-3 GB RAM → OOM on
+          # the 7 GB runner. Unix Makefiles serialises them so only one runs at a time.
+          sed -i 's|cmake "\$ROOTDIR/zig"|cmake -G "Unix Makefiles" "\$ROOTDIR/zig"|' bootstrap/build
           # Stop before cross LLVM build
           sed -i '/# Now we have Zig as a cross compiler/i exit 0' bootstrap/build
           echo "=== Verified patches ==="
-          grep -n 'MinSizeRel\|TARGETS_TO_BUILD\|exit 0' bootstrap/build
+          grep -n 'MinSizeRel\|TARGETS_TO_BUILD\|Unix Makefiles\|exit 0' bootstrap/build
           df -h
 
       - name: Build host LLVM + host Zig
