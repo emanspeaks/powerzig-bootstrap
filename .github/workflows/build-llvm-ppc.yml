@@ -205,29 +205,15 @@ jobs:
       - name: Patch for host-only build
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          # Use MinSizeRel for host LLVM and host Zig (build-time tools only)
+          # Use MinSizeRel for host tools (smaller, slightly faster to compile than Release)
           sed -i '0,/-DCMAKE_BUILD_TYPE=Release/{s/-DCMAKE_BUILD_TYPE=Release/-DCMAKE_BUILD_TYPE=MinSizeRel/}' bootstrap/build
           sed -i '0,/-DCMAKE_BUILD_TYPE=Release/{s/-DCMAKE_BUILD_TYPE=Release/-DCMAKE_BUILD_TYPE=MinSizeRel/}' bootstrap/build
-          # Limit host LLVM to PowerPC target only — we only need it to emit powerpc code
-          # when zig cc cross-compiles the cross LLVM in the next job. Cuts build time dramatically.
-          sed -i '0,/-DCLANG_TOOL_LIBCLANG_BUILD=OFF/{s/-DCLANG_TOOL_LIBCLANG_BUILD=OFF/-DCLANG_TOOL_LIBCLANG_BUILD=OFF \\\n    -DLLVM_TARGETS_TO_BUILD=PowerPC/}' bootstrap/build
-          # NOTE: do NOT remove out/build-llvm-host — clang-tblgen lives there and
-          # is required by the cross LLVM cmake (CLANG_TABLEGEN=.../build-llvm-host/bin/clang-tblgen)
-          # After host LLVM install: log disk/RAM state, then delete LLVM .o files to
-          # reclaim ~10-15 GB before the Zig build (keeps bin/ for clang-tblgen).
-          sed -i '/^# Now we build Zig, still/i find "$ROOTDIR/out/build-llvm-host" -type f -name "*.o" -delete 2>/dev/null || true' bootstrap/build
-          sed -i '/^# Now we build Zig, still/i df -h; free -h' bootstrap/build
-          # Force serial host Zig cmake build to prevent the two simultaneous zig1 WASM
-          # interpreter invocations (zig2.c + compiler_rt.c) from OOMing the 7 GB runner.
-          # Belt+suspenders:
-          #   1. CMAKE_BUILD_PARALLEL_LEVEL=1  — cmake passes -j1 to any build tool
-          #   2. -G "Unix Makefiles"           — make defaults to -j1 even if env var missed
-          sed -i '/^mkdir -p.*build-zig-host/i export CMAKE_BUILD_PARALLEL_LEVEL=1' bootstrap/build
-          sed -i 's|cmake "\$ROOTDIR/zig"|cmake -G "Unix Makefiles" "\$ROOTDIR/zig"|' bootstrap/build
-          # Stop before cross LLVM build
+          # Exit after host Zig is built; cross compilation runs in subsequent jobs.
+          # NOTE: host LLVM must be built with ALL default targets — Zig's cmake checks for
+          # AArch64, x86, etc. Do NOT add LLVM_TARGETS_TO_BUILD here.
           sed -i '/# Now we have Zig as a cross compiler/i exit 0' bootstrap/build
           echo "=== Verified patches ==="
-          grep -n 'MinSizeRel\|TARGETS_TO_BUILD\|Unix Makefiles\|CMAKE_BUILD_PARALLEL_LEVEL\|exit 0' bootstrap/build
+          grep -n 'MinSizeRel\|exit 0' bootstrap/build
           df -h
 
       - name: Build host LLVM + host Zig
