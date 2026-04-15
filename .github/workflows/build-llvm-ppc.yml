@@ -205,15 +205,12 @@ jobs:
       - name: Patch for host-only build
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          # Use MinSizeRel for host tools (smaller, slightly faster to compile than Release)
-          sed -i '0,/-DCMAKE_BUILD_TYPE=Release/{s/-DCMAKE_BUILD_TYPE=Release/-DCMAKE_BUILD_TYPE=MinSizeRel/}' bootstrap/build
-          sed -i '0,/-DCMAKE_BUILD_TYPE=Release/{s/-DCMAKE_BUILD_TYPE=Release/-DCMAKE_BUILD_TYPE=MinSizeRel/}' bootstrap/build
           # Exit after host Zig is built; cross compilation runs in subsequent jobs.
           # NOTE: host LLVM must be built with ALL default targets — Zig's cmake checks for
           # AArch64, x86, etc. Do NOT add LLVM_TARGETS_TO_BUILD here.
           sed -i '/# Now we have Zig as a cross compiler/i exit 0' bootstrap/build
           echo "=== Verified patches ==="
-          grep -n 'MinSizeRel\|exit 0' bootstrap/build
+          grep -n 'exit 0' bootstrap/build
           df -h
 
       - name: Build host LLVM + host Zig
