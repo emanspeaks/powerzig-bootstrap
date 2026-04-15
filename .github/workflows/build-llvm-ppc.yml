@@ -187,17 +187,14 @@ jobs:
 
       - name: Install build dependencies
         if: steps.cache.outputs.cache-hit != 'true'
-        run: sudo apt-get install -y -qq cmake ninja-build xz-utils python3
-
-      - name: Create swap file (prevents OOM during LLVM 21 static link)
-        if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          sudo sysctl vm.swappiness=10
-          free -h
+          sudo apt-get install -y -qq cmake ninja-build xz-utils python3 mold
+          # mold uses memory-mapped I/O rather than loading all objects into RAM,
+          # reducing peak link RAM from ~5 GB (GNU ld + LLVM 21 static libs) to ~1.5 GB.
+          # This prevents OOM on the 7 GB GitHub Actions runner during the host Zig link.
+          sudo update-alternatives --install /usr/bin/ld ld /usr/bin/mold 100
+          sudo update-alternatives --set ld /usr/bin/mold
+          ld --version
 
       - name: Clone zig-bootstrap from Codeberg
         if: steps.cache.outputs.cache-hit != 'true'
