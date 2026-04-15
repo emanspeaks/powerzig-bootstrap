@@ -189,6 +189,16 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: sudo apt-get install -y -qq cmake ninja-build xz-utils python3
 
+      - name: Create swap file (prevents OOM during LLVM 21 static link)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo sysctl vm.swappiness=10
+          free -h
+
       - name: Clone zig-bootstrap from Codeberg
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
@@ -371,8 +381,9 @@ jobs:
           sed -i 's/-DLLD_BUILD_TOOLS=OFF/-DLLD_BUILD_TOOLS=OFF \\\n    -DLLVM_TARGETS_TO_BUILD=PowerPC/' bootstrap/build
           # Wire ccache into the cross LLVM cmake so compiled objects survive the job boundary
           sed -i '/# Rebuild LLVM with Zig/,/cmake --build/{s/-DLLVM_TARGETS_TO_BUILD=PowerPC/-DLLVM_TARGETS_TO_BUILD=PowerPC \\\n    -DCMAKE_C_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_ASM_COMPILER_LAUNCHER=ccache/}' bootstrap/build
-          # Compile-only: strip --target install. Job 2b restores ccache and runs install.
-          sed -i 's/cmake --build \. --target install/cmake --build ./' bootstrap/build
+          # Compile-only: strip --target install from cross LLVM ONLY (not from cross zlib,
+          # which must install its headers/libs so the cross LLVM cmake can find them).
+          sed -i '/# Rebuild LLVM with Zig/,/cmake --build \./{s/cmake --build \. --target install/cmake --build ./}' bootstrap/build
           # Stop before cross Zig (we build Zig separately in powerzig repo)
           sed -i '/# Finally, we can cross compile Zig itself/a exit 0' bootstrap/build
           echo "=== Verified patches ==="
