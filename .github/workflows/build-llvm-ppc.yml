@@ -553,9 +553,11 @@ jobs:
       - name: Package LLVM artifacts
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          # Release artifact: just zig binary (powerzig only needs this)
-          mkdir -p release-host/bin
+          # Host Zig: full install layout matching cmake --target install output
+          # lib/zig may be a symlink to bootstrap/zig/lib; use -L to dereference.
+          mkdir -p release-host/bin release-host/lib
           cp bootstrap/out/host/bin/zig release-host/bin/zig
+          cp -rL bootstrap/out/host/lib/zig release-host/lib/zig
           tar -cJf llvm-host-zig.tar.xz -C release-host .
           # Cross LLVM install prefix
           tar -cJf llvm-cross-powerpc32.tar.xz -C bootstrap/out "$ZIG_TARGET-$ZIG_CPU"
