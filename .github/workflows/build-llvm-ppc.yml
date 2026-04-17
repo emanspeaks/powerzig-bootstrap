@@ -23,6 +23,8 @@ name: Build LLVM for PowerPC 32-bit
 
 on:
   push:
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       release_tag:
@@ -52,9 +54,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release_tag:      ${{ steps.tag.outputs.release_tag }}
-      should_build:     ${{ steps.gate.outputs.should_build }}
-      should_release:   ${{ steps.gate.outputs.should_release }}
-      bootstrap_commit: ${{ steps.clone.outputs.bootstrap_commit }}
+      should_build:      ${{ steps.gate.outputs.should_build }}
+      should_release:    ${{ steps.gate.outputs.should_release }}
+      should_prerelease: ${{ steps.gate.outputs.should_prerelease }}
+      bootstrap_commit:  ${{ steps.clone.outputs.bootstrap_commit }}
       zig_version:      ${{ steps.clone.outputs.zig_version }}
     steps:
       - name: Clone zig-bootstrap from Codeberg
@@ -84,9 +87,21 @@ jobs:
           IS_MAIN="false"
           [[ "$REF" == "refs/heads/main" ]] && IS_MAIN="true"
 
+          if [[ "$EVENT" == "pull_request" ]]; then
+            # Only same-repo PRs get pre-releases; fork PRs have read-only GITHUB_TOKEN anyway.
+            IS_SAME_REPO="false"
+            [[ "${{ github.event.pull_request.head.repo.full_name }}" == "${{ github.repository }}" ]] && IS_SAME_REPO="true"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "should_prerelease=$IS_SAME_REPO" >> "$GITHUB_OUTPUT"
+            echo "PR event — build=true release=false prerelease=$IS_SAME_REPO (same-repo=$IS_SAME_REPO)"
+            exit 0
+          fi
+
           if [[ "$EVENT" == "push" ]]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
             echo "should_release=$IS_MAIN" >> "$GITHUB_OUTPUT"
+            echo "should_prerelease=false" >> "$GITHUB_OUTPUT"
             echo "Push on $REF — build=true release=$IS_MAIN"
             exit 0
           fi
@@ -97,24 +112,28 @@ jobs:
             if [[ "$FORCE" != "true" ]] && gh release view "$TAG" --repo "${{ github.repository }}" &>/dev/null; then
               echo "should_build=false" >> "$GITHUB_OUTPUT"
               echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "should_prerelease=false" >> "$GITHUB_OUTPUT"
               echo "Release $TAG already exists (use force_rebuild to overwrite)"
             else
               echo "should_build=true" >> "$GITHUB_OUTPUT"
               echo "should_release=true" >> "$GITHUB_OUTPUT"
+              echo "should_prerelease=false" >> "$GITHUB_OUTPUT"
               echo "Dispatch — build=true release=true (tag $TAG)"
             fi
             exit 0
           fi
 
-          # schedule: only build+release if zig-bootstrap commit changed
-          LATEST_RELEASE=$(gh release list --repo "${{ github.repository }}" --limit 1 \
-            --json tagName --jq '.[0].tagName // ""')
+          # schedule: only build+release if zig-bootstrap commit changed since last full release
+          LATEST_RELEASE=$(gh release list --repo "${{ github.repository }}" --limit 20 \
+            --json tagName,isPrerelease \
+            --jq '[.[] | select(.isPrerelease == false)] | .[0].tagName // ""')
           if [[ -n "$LATEST_RELEASE" ]]; then
             PREV_COMMIT=$(gh release view "$LATEST_RELEASE" --repo "${{ github.repository }}" \
               --json body --jq '.body' | grep -oP '(?<=zig-bootstrap commit: \`)[^\`]+' || true)
             if [[ "$PREV_COMMIT" == "$BOOTSTRAP_COMMIT" ]]; then
               echo "should_build=false" >> "$GITHUB_OUTPUT"
               echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "should_prerelease=false" >> "$GITHUB_OUTPUT"
               echo "zig-bootstrap commit $BOOTSTRAP_COMMIT unchanged since $LATEST_RELEASE — skipping"
               exit 0
             fi
@@ -124,6 +143,7 @@ jobs:
           fi
           echo "should_build=true" >> "$GITHUB_OUTPUT"
           echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "should_prerelease=false" >> "$GITHUB_OUTPUT"
 
       - name: Resolve release tag
         id: tag
@@ -582,6 +602,24 @@ jobs:
             --cleanup-tag \
             --yes 2>/dev/null || true
 
+      - name: Create pre-release (same-repo PR validation)
+        if: needs.prepare.outputs.should_prerelease == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PRE_TAG="pre-$BOOTSTRAP_COMMIT"
+          # Delete any existing pre-release for this commit (safe re-run)
+          gh release delete "$PRE_TAG" --repo "${{ github.repository }}" --cleanup-tag --yes 2>/dev/null || true
+          RELEASE_TAG="$PRE_TAG" envsubst < .github/release-notes/llvm-template.md > /tmp/release-notes.md
+          gh release create "$PRE_TAG" \
+            --repo "${{ github.repository }}" \
+            --title "LLVM for PowerPC 32-bit (pre-release) $PRE_TAG" \
+            --notes-file /tmp/release-notes.md \
+            --prerelease \
+            llvm-host-zig.tar.xz \
+            llvm-cross-powerpc32.tar.xz
+          echo "Pre-release created: $PRE_TAG"
+
       - name: Publish LLVM Release
         if: needs.prepare.outputs.should_release == 'true'
         env:
@@ -592,6 +630,9 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "LLVM for PowerPC 32-bit $RELEASE_TAG" \
             --notes-file /tmp/release-notes.md \
-            --prerelease \
             llvm-host-zig.tar.xz \
             llvm-cross-powerpc32.tar.xz
+          # Clean up any PR pre-release for this bootstrap commit
+          PRE_TAG="pre-$BOOTSTRAP_COMMIT"
+          gh release delete "$PRE_TAG" --repo "${{ github.repository }}" --cleanup-tag --yes 2>/dev/null || true
+          echo "Full release created: $RELEASE_TAG"
