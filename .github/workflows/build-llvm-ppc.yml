@@ -1,0 +1,597 @@
+name: Build LLVM for PowerPC 32-bit
+
+# Builds host LLVM + host Zig + cross LLVM for powerpc-linux-musleabihf using
+# zig-bootstrap, and publishes the result as a GitHub Release.
+#
+# The build is split into three jobs to stay under GitHub's 6-hour per-job limit:
+#   build-host        — host LLVM + host Zig
+#   build-cross-llvm  — cross LLVM+clang+lld compile only (5h), saves ccache on exit
+#   build-cross-clang-lld — restores ccache (all objects cached), cmake install, publish
+#
+# Releases use this repo's own sequential versioning (v1, v2, …), independent of
+# upstream Zig or LLVM version numbers.
+#
+# Triggers:
+#   push (any branch) — always builds for validation; releases only from main
+#   workflow_dispatch  — manual run with explicit release tag; always releases
+#   schedule (weekly)  — only builds+releases if zig-bootstrap commit changed upstream
+#
+# Caching:
+#   Each job caches its output keyed on the zig-bootstrap commit hash.
+#   After a feature branch run succeeds, merging to main hits the cache and
+#   skips the multi-hour build, going straight to publish.
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to create (e.g. v1, v2). Must not already exist unless force_rebuild is true.'
+        type: string
+        required: true
+      force_rebuild:
+        description: 'Overwrite existing release if it already exists'
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    - cron: '0 3 * * 0'   # Every Sunday at 03:00 UTC
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────────
+  # Resolve bootstrap commit, decide whether to build and/or release.
+  # ───────────────────────────────────────────────────────────────────────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag:      ${{ steps.tag.outputs.release_tag }}
+      should_build:     ${{ steps.gate.outputs.should_build }}
+      should_release:   ${{ steps.gate.outputs.should_release }}
+      bootstrap_commit: ${{ steps.clone.outputs.bootstrap_commit }}
+      zig_version:      ${{ steps.clone.outputs.zig_version }}
+    steps:
+      - name: Clone zig-bootstrap from Codeberg
+        id: clone
+        run: |
+          git clone --depth 1 https://codeberg.org/ziglang/zig-bootstrap.git bootstrap
+          COMMIT=$(git -C bootstrap rev-parse --short HEAD)
+          echo "bootstrap_commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "Cloned zig-bootstrap at commit: $COMMIT"
+          cd bootstrap
+          if [[ -f zig-version ]]; then
+            ZV=$(tr -d '[:space:]' < zig-version)
+          else
+            ZV=$(grep -m1 'ZIG_VERSION' build | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^" [:space:]]*' || echo "unknown")
+          fi
+          echo "zig_version=$ZV" >> "$GITHUB_OUTPUT"
+          echo "Zig version: $ZV"
+
+      - name: Determine if build and release are needed
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BOOTSTRAP_COMMIT: ${{ steps.clone.outputs.bootstrap_commit }}
+        run: |
+          EVENT="${{ github.event_name }}"
+          REF="${{ github.ref }}"
+          IS_MAIN="false"
+          [[ "$REF" == "refs/heads/main" ]] && IS_MAIN="true"
+
+          if [[ "$EVENT" == "push" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "should_release=$IS_MAIN" >> "$GITHUB_OUTPUT"
+            echo "Push on $REF — build=true release=$IS_MAIN"
+            exit 0
+          fi
+
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            FORCE="${{ inputs.force_rebuild }}"
+            TAG="${{ inputs.release_tag }}"
+            if [[ "$FORCE" != "true" ]] && gh release view "$TAG" --repo "${{ github.repository }}" &>/dev/null; then
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "Release $TAG already exists (use force_rebuild to overwrite)"
+            else
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+              echo "Dispatch — build=true release=true (tag $TAG)"
+            fi
+            exit 0
+          fi
+
+          # schedule: only build+release if zig-bootstrap commit changed
+          LATEST_RELEASE=$(gh release list --repo "${{ github.repository }}" --limit 1 \
+            --json tagName --jq '.[0].tagName // ""')
+          if [[ -n "$LATEST_RELEASE" ]]; then
+            PREV_COMMIT=$(gh release view "$LATEST_RELEASE" --repo "${{ github.repository }}" \
+              --json body --jq '.body' | grep -oP '(?<=zig-bootstrap commit: \`)[^\`]+' || true)
+            if [[ "$PREV_COMMIT" == "$BOOTSTRAP_COMMIT" ]]; then
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "zig-bootstrap commit $BOOTSTRAP_COMMIT unchanged since $LATEST_RELEASE — skipping"
+              exit 0
+            fi
+            echo "zig-bootstrap commit changed: $PREV_COMMIT → $BOOTSTRAP_COMMIT"
+          else
+            echo "No existing releases — first build"
+          fi
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve release tag
+        id: tag
+        if: steps.gate.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            LATEST=$(gh release list --repo "${{ github.repository }}" --limit 50 \
+              --json tagName --jq '[.[].tagName | select(test("^v[0-9]+$"))] | sort_by(ltrimstr("v") | tonumber) | last // "v0"')
+            N=$(echo "$LATEST" | grep -oE '[0-9]+')
+            TAG="v$((N + 1))"
+            echo "Auto-increment — next tag: $TAG (latest was $LATEST)"
+          fi
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
+  # ───────────────────────────────────────────────────────────────────────────────
+  # Job 1: Build host LLVM + host Zig
+  # ───────────────────────────────────────────────────────────────────────────────
+  build-host:
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      BOOTSTRAP_COMMIT: ${{ needs.prepare.outputs.bootstrap_commit }}
+      ZIG_TARGET:       powerpc-linux-musleabihf
+      ZIG_CPU:          baseline
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Restore host build cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: llvm-host-tools.tar.xz
+          key: llvm-host-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
+
+      - name: Free up runner disk space
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /usr/local/.ghcup \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/share/swift \
+            /usr/local/julia* \
+            /usr/lib/jvm \
+            /usr/share/miniconda
+          sudo docker image prune --all --force 2>/dev/null || true
+          sudo apt-get clean -y
+          sudo apt-get autoremove -y -qq
+          df -h
+
+      - name: Install build dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get install -y -qq cmake ninja-build xz-utils python3 mold
+          # mold uses memory-mapped I/O rather than loading all objects into RAM,
+          # reducing peak link RAM from ~5 GB (GNU ld + LLVM 21 static libs) to ~1.5 GB.
+          # This prevents OOM on the 7 GB GitHub Actions runner during the host Zig link.
+          sudo update-alternatives --install /usr/bin/ld ld /usr/bin/mold 100
+          sudo update-alternatives --set ld /usr/bin/mold
+          ld --version
+
+      - name: Clone zig-bootstrap from Codeberg
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://codeberg.org/ziglang/zig-bootstrap.git bootstrap
+          echo "Cloned at commit: $BOOTSTRAP_COMMIT"
+
+      - name: Patch for host-only build
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          # Exit after host Zig is built; cross compilation runs in subsequent jobs.
+          # NOTE: host LLVM must be built with ALL default targets — Zig's cmake checks for
+          # AArch64, x86, etc. Do NOT add LLVM_TARGETS_TO_BUILD here.
+          sed -i '/# Now we have Zig as a cross compiler/i exit 0' bootstrap/build
+          echo "=== Verified patches ==="
+          grep -n 'exit 0' bootstrap/build
+          df -h
+
+      - name: Build host LLVM + host Zig
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          echo "Target: $ZIG_TARGET  CPU: $ZIG_CPU  Bootstrap: $BOOTSTRAP_COMMIT"
+          cd bootstrap
+          ./build "$ZIG_TARGET" "$ZIG_CPU"
+          df -h
+
+      - name: Package host tools
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          HOST_ZIG="bootstrap/out/host/bin/zig"
+          CLANG_TBLGEN="bootstrap/out/build-llvm-host/bin/clang-tblgen"
+          [[ ! -f "$HOST_ZIG" ]] && echo "ERROR: host Zig binary missing" && exit 1
+          [[ ! -f "$CLANG_TBLGEN" ]] && echo "ERROR: clang-tblgen missing (needed for cross LLVM cmake)" && exit 1
+          echo "Host Zig: $(file $HOST_ZIG)"
+
+          # Package all binaries the cross LLVM cmake needs:
+          #   out/host/bin/{zig,llvm-tblgen,llvm-ar,llvm-ranlib,llvm-rc}
+          #   out/build-llvm-host/bin/clang-tblgen
+          mkdir -p host-tools/host/bin host-tools/build-llvm-host/bin
+          for tool in zig llvm-tblgen llvm-ar llvm-ranlib llvm-rc; do
+            src="bootstrap/out/host/bin/$tool"
+            if [[ -f "$src" ]]; then
+              cp "$src" host-tools/host/bin/
+              echo "  included: $tool ($(du -sh $src | cut -f1))"
+            else
+              echo "  warning: $tool not found in out/host/bin/"
+            fi
+          done
+          cp "$CLANG_TBLGEN" host-tools/build-llvm-host/bin/
+          echo "  included: clang-tblgen ($(du -sh $CLANG_TBLGEN | cut -f1))"
+
+          tar -cJf llvm-host-tools.tar.xz -C host-tools .
+          ls -lah llvm-host-tools.tar.xz
+
+      - name: Save host build cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: llvm-host-tools.tar.xz
+          key: llvm-host-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
+
+      - name: Upload host artifact for cross build
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-host-tools
+          path: llvm-host-tools.tar.xz
+          retention-days: 1
+
+  # ───────────────────────────────────────────────────────────────────────────────
+  # Job 2a: Compile cross LLVM + clang + lld (5-hour limit, no cmake install).
+  # Saves ccache before the 6-hour hard kill so Job 2b can resume with a warm cache.
+  # ───────────────────────────────────────────────────────────────────────────────
+  build-cross-llvm:
+    needs: [prepare, build-host]
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    env:
+      RELEASE_TAG:      ${{ needs.prepare.outputs.release_tag }}
+      BOOTSTRAP_COMMIT: ${{ needs.prepare.outputs.bootstrap_commit }}
+      ZIG_VERSION:      ${{ needs.prepare.outputs.zig_version }}
+      ZIG_TARGET:       powerpc-linux-musleabihf
+      ZIG_CPU:          baseline
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      CCACHE_DIR:       ${{ github.workspace }}/.ccache
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore full build cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            llvm-host-zig.tar.xz
+            llvm-cross-powerpc32.tar.xz
+          key: llvm-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
+
+      - name: Free up runner disk space
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /usr/local/.ghcup \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/share/swift \
+            /usr/local/julia* \
+            /usr/lib/jvm \
+            /usr/share/miniconda
+          sudo docker image prune --all --force 2>/dev/null || true
+          sudo apt-get clean -y
+          sudo apt-get autoremove -y -qq
+          df -h
+
+      - name: Install build dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: sudo apt-get install -y -qq cmake ninja-build xz-utils python3 ccache
+
+      - name: Restore ccache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-
+            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-
+
+      - name: Configure ccache
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          ccache --set-config=max_size=8G
+          ccache --set-config=compression=true
+          ccache -z
+          echo "ccache dir: $CCACHE_DIR"
+
+      - name: Download host artifact
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: llvm-host-tools
+
+      - name: Clone zig-bootstrap from Codeberg
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://codeberg.org/ziglang/zig-bootstrap.git bootstrap
+          echo "Cloned at commit: $BOOTSTRAP_COMMIT"
+
+      - name: Extract host tools into bootstrap tree
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p bootstrap/out
+          tar -xJf llvm-host-tools.tar.xz -C bootstrap/out
+          chmod +x bootstrap/out/host/bin/zig
+          chmod +x bootstrap/out/host/bin/llvm-tblgen 2>/dev/null || true
+          chmod +x bootstrap/out/host/bin/llvm-ar 2>/dev/null || true
+          chmod +x bootstrap/out/host/bin/llvm-ranlib 2>/dev/null || true
+          chmod +x bootstrap/out/host/bin/llvm-rc 2>/dev/null || true
+          chmod +x bootstrap/out/build-llvm-host/bin/clang-tblgen
+          mkdir -p bootstrap/out/host/lib
+          ln -s "$(pwd)/bootstrap/zig/lib" bootstrap/out/host/lib/zig
+          echo "Host Zig: $(bootstrap/out/host/bin/zig version)"
+
+      - name: Patch for compile-only cross build
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          # Skip host LLVM + host Zig stages (host zig already provided)
+          python3 .github/scripts/patch-for-cross-only.py bootstrap/build
+          # Limit cross LLVM to PowerPC target only
+          sed -i 's/-DLLD_BUILD_TOOLS=OFF/-DLLD_BUILD_TOOLS=OFF \\\n    -DLLVM_TARGETS_TO_BUILD=PowerPC/' bootstrap/build
+          # Wire ccache into the cross LLVM cmake so compiled objects survive the job boundary
+          sed -i '/# Rebuild LLVM with Zig/,/cmake --build/{s/-DLLVM_TARGETS_TO_BUILD=PowerPC/-DLLVM_TARGETS_TO_BUILD=PowerPC \\\n    -DCMAKE_C_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_ASM_COMPILER_LAUNCHER=ccache/}' bootstrap/build
+          # Compile-only: strip --target install from cross LLVM ONLY (not from cross zlib,
+          # which must install its headers/libs so the cross LLVM cmake can find them).
+          sed -i '/# Rebuild LLVM with Zig/,/cmake --build \./{s/cmake --build \. --target install/cmake --build ./}' bootstrap/build
+          # Stop before cross Zig (we build Zig separately in powerzig repo)
+          sed -i '/# Finally, we can cross compile Zig itself/a exit 0' bootstrap/build
+          echo "=== Verified patches ==="
+          grep -n 'TARGETS_TO_BUILD\|COMPILER_LAUNCHER\|exit 0\|--target install' bootstrap/build || true
+
+      - name: Compile cross LLVM + clang + lld (no install)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          echo "Target: $ZIG_TARGET  CPU: $ZIG_CPU  Bootstrap: $BOOTSTRAP_COMMIT"
+          cd bootstrap
+          ./build "$ZIG_TARGET" "$ZIG_CPU"
+          df -h
+
+      - name: ccache stats
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        run: ccache -s
+
+      - name: Save ccache
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
+
+  # ───────────────────────────────────────────────────────────────────────────────
+  # Job 2b: Complete the cross build — install, package and publish.
+  # Restores Job 2a's ccache; all already-compiled objects are cache hits so only
+  # linking + cmake install remains. Runs even if Job 2a timed out.
+  # ───────────────────────────────────────────────────────────────────────────────
+  build-cross-clang-lld:
+    needs: [prepare, build-host, build-cross-llvm]
+    if: |
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.prepare.outputs.should_build == 'true' &&
+      needs.build-host.result == 'success' &&
+      needs.build-cross-llvm.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      RELEASE_TAG:      ${{ needs.prepare.outputs.release_tag }}
+      BOOTSTRAP_COMMIT: ${{ needs.prepare.outputs.bootstrap_commit }}
+      ZIG_VERSION:      ${{ needs.prepare.outputs.zig_version }}
+      ZIG_TARGET:       powerpc-linux-musleabihf
+      ZIG_CPU:          baseline
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      CCACHE_DIR:       ${{ github.workspace }}/.ccache
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore full build cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            llvm-host-zig.tar.xz
+            llvm-cross-powerpc32.tar.xz
+          key: llvm-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
+
+      - name: Free up runner disk space
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /usr/local/.ghcup \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/share/swift \
+            /usr/local/julia* \
+            /usr/lib/jvm \
+            /usr/share/miniconda
+          sudo docker image prune --all --force 2>/dev/null || true
+          sudo apt-get clean -y
+          sudo apt-get autoremove -y -qq
+          df -h
+
+      - name: Install build dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: sudo apt-get install -y -qq cmake ninja-build xz-utils python3 ccache
+
+      - name: Restore ccache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          # Primary: own previous save (re-run). First fallback: Job 2a LLVM-core cache.
+          key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
+            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-
+            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-
+            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-
+
+      - name: Configure ccache
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          ccache --set-config=max_size=8G
+          ccache --set-config=compression=true
+          ccache -z
+          echo "ccache dir: $CCACHE_DIR"
+
+      - name: Download host artifact
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: llvm-host-tools
+
+      - name: Clone zig-bootstrap from Codeberg
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://codeberg.org/ziglang/zig-bootstrap.git bootstrap
+          echo "Cloned at commit: $BOOTSTRAP_COMMIT"
+
+      - name: Extract host tools into bootstrap tree
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p bootstrap/out
+          tar -xJf llvm-host-tools.tar.xz -C bootstrap/out
+          chmod +x bootstrap/out/host/bin/zig
+          chmod +x bootstrap/out/host/bin/llvm-tblgen 2>/dev/null || true
+          chmod +x bootstrap/out/host/bin/llvm-ar 2>/dev/null || true
+          chmod +x bootstrap/out/host/bin/llvm-ranlib 2>/dev/null || true
+          chmod +x bootstrap/out/host/bin/llvm-rc 2>/dev/null || true
+          chmod +x bootstrap/out/build-llvm-host/bin/clang-tblgen
+          mkdir -p bootstrap/out/host/lib
+          ln -s "$(pwd)/bootstrap/zig/lib" bootstrap/out/host/lib/zig
+          echo "Host Zig: $(bootstrap/out/host/bin/zig version)"
+          echo "Tools present: $(ls bootstrap/out/host/bin/ bootstrap/out/build-llvm-host/bin/)"
+
+      - name: Patch for full cross build (clang + lld + install)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          # Skip host LLVM + host Zig stages (host zig already provided)
+          python3 .github/scripts/patch-for-cross-only.py bootstrap/build
+          # Limit cross LLVM to PowerPC target only
+          sed -i 's/-DLLD_BUILD_TOOLS=OFF/-DLLD_BUILD_TOOLS=OFF \\\n    -DLLVM_TARGETS_TO_BUILD=PowerPC/' bootstrap/build
+          # Wire ccache — LLVM objects from Job 2a are cache hits; only clang+lld are new
+          sed -i '/# Rebuild LLVM with Zig/,/cmake --build/{s/-DLLVM_TARGETS_TO_BUILD=PowerPC/-DLLVM_TARGETS_TO_BUILD=PowerPC \\\n    -DCMAKE_C_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_ASM_COMPILER_LAUNCHER=ccache/}' bootstrap/build
+          # Note: LLVM_ENABLE_PROJECTS is kept as-is (clang + lld); do NOT strip --target install.
+          # Stop before cross Zig (we build Zig separately in powerzig repo)
+          sed -i '/# Finally, we can cross compile Zig itself/a exit 0' bootstrap/build
+          echo "=== Verified patches ==="
+          grep -n 'TARGETS_TO_BUILD\|COMPILER_LAUNCHER\|ENABLE_PROJECTS\|exit 0\|--target install' bootstrap/build || true
+
+      - name: Build clang + lld and install (LLVM objects from ccache)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          echo "Target: $ZIG_TARGET  CPU: $ZIG_CPU  Bootstrap: $BOOTSTRAP_COMMIT"
+          cd bootstrap
+          ./build "$ZIG_TARGET" "$ZIG_CPU"
+          df -h
+
+      - name: ccache stats
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        run: ccache -s
+
+      - name: Save ccache
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify cross LLVM build
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          CROSS_CMAKE="bootstrap/out/$ZIG_TARGET-$ZIG_CPU/lib/cmake/llvm/LLVMConfig.cmake"
+          [[ ! -f "$CROSS_CMAKE" ]] && echo "ERROR: cross LLVM cmake config missing" && find bootstrap/out -maxdepth 4 | sort && exit 1
+          echo "Cross LLVM: $(ls bootstrap/out/$ZIG_TARGET-$ZIG_CPU/lib/*.a 2>/dev/null | wc -l) static libs"
+
+      - name: Package LLVM artifacts
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          # Host Zig: full install layout matching cmake --target install output
+          # lib/zig may be a symlink to bootstrap/zig/lib; use -L to dereference.
+          mkdir -p release-host/bin release-host/lib
+          cp bootstrap/out/host/bin/zig release-host/bin/zig
+          cp -rL bootstrap/out/host/lib/zig release-host/lib/zig
+          tar -cJf llvm-host-zig.tar.xz -C release-host .
+          # Cross LLVM install prefix
+          tar -cJf llvm-cross-powerpc32.tar.xz -C bootstrap/out "$ZIG_TARGET-$ZIG_CPU"
+          ls -lah llvm-host-zig.tar.xz llvm-cross-powerpc32.tar.xz
+
+      - name: Save full build cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            llvm-host-zig.tar.xz
+            llvm-cross-powerpc32.tar.xz
+          key: llvm-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
+
+      - name: Delete existing release (force-rebuild only)
+        if: needs.prepare.outputs.should_release == 'true' && inputs.force_rebuild == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "$RELEASE_TAG" \
+            --repo "${{ github.repository }}" \
+            --cleanup-tag \
+            --yes 2>/dev/null || true
+
+      - name: Publish LLVM Release
+        if: needs.prepare.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          envsubst < .github/release-notes/llvm-template.md > /tmp/release-notes.md
+          gh release create "$RELEASE_TAG" \
+            --repo "${{ github.repository }}" \
+            --title "LLVM for PowerPC 32-bit $RELEASE_TAG" \
+            --notes-file /tmp/release-notes.md \
+            --prerelease \
+            llvm-host-zig.tar.xz \
+            llvm-cross-powerpc32.tar.xz
