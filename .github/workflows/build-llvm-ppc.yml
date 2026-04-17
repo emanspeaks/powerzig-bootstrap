@@ -23,6 +23,7 @@ name: Build LLVM for PowerPC 32-bit
 
 on:
   push:
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
