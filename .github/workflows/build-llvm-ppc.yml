@@ -655,6 +655,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PRE_TAG="pre-$BOOTSTRAP_COMMIT"
+          # Fast path: pre-release already has correct artifacts — don't recreate (tag may be immutable)
+          if [[ "$PRERELEASE_READY" == "true" ]]; then
+            echo "Pre-release $PRE_TAG already has correct artifacts — skipping re-creation"
+            exit 0
+          fi
           # Delete any existing pre-release for this commit (safe re-run)
           gh release delete "$PRE_TAG" --repo "${{ github.repository }}" --cleanup-tag --yes 2>/dev/null || true
           RELEASE_TAG="$PRE_TAG" envsubst < .github/release-notes/llvm-template.md > /tmp/release-notes.md
