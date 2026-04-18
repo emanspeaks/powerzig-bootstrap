@@ -54,12 +54,13 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      release_tag:       ${{ steps.tag.outputs.release_tag }}
-      should_build:      ${{ steps.gate.outputs.should_build }}
-      should_release:    ${{ steps.gate.outputs.should_release }}
-      should_prerelease: ${{ steps.gate.outputs.should_prerelease }}
-      bootstrap_commit:  ${{ steps.commit.outputs.bootstrap_commit }}
-      zig_version:       ${{ steps.zig_version.outputs.zig_version }}
+      release_tag:        ${{ steps.tag.outputs.release_tag }}
+      should_build:       ${{ steps.gate.outputs.should_build }}
+      should_release:     ${{ steps.gate.outputs.should_release }}
+      should_prerelease:  ${{ steps.gate.outputs.should_prerelease }}
+      bootstrap_commit:   ${{ steps.commit.outputs.bootstrap_commit }}
+      zig_version:        ${{ steps.zig_version.outputs.zig_version }}
+      prerelease_ready:   ${{ steps.prerelease.outputs.prerelease_ready }}
     steps:
       - name: Get zig-bootstrap HEAD commit
         id: commit
@@ -155,6 +156,27 @@ jobs:
           echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Release tag: $TAG"
 
+      - name: Check for pre-release artifacts (fast path on merge-to-main)
+        id: prerelease
+        if: steps.gate.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BOOTSTRAP_COMMIT: ${{ steps.commit.outputs.bootstrap_commit }}
+        run: |
+          PRE_TAG="pre-$BOOTSTRAP_COMMIT"
+          READY=false
+          if gh release view "$PRE_TAG" --repo "${{ github.repository }}" &>/dev/null; then
+            ASSETS=$(gh release view "$PRE_TAG" --repo "${{ github.repository }}" \
+              --json assets --jq '[.assets[].name]')
+            HAS_HOST=$(echo "$ASSETS" | jq 'contains(["llvm-host-zig.tar.xz"])')
+            HAS_CROSS=$(echo "$ASSETS" | jq 'contains(["llvm-cross-powerpc32.tar.xz"])')
+            if [[ "$HAS_HOST" == "true" && "$HAS_CROSS" == "true" ]]; then
+              READY=true
+              echo "Pre-release $PRE_TAG has both artifacts — skipping rebuild"
+            fi
+          fi
+          echo "prerelease_ready=$READY" >> "$GITHUB_OUTPUT"
+
       - name: Get Zig version from zig-bootstrap (only when building)
         id: zig_version
         if: steps.gate.outputs.should_build == 'true'
@@ -174,7 +196,7 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────────
   build-host:
     needs: prepare
-    if: needs.prepare.outputs.should_build == 'true'
+    if: needs.prepare.outputs.should_build == 'true' && needs.prepare.outputs.prerelease_ready != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -295,7 +317,7 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────────
   build-cross-llvm:
     needs: [prepare, build-host]
-    if: needs.prepare.outputs.should_build == 'true'
+    if: needs.prepare.outputs.should_build == 'true' && needs.prepare.outputs.prerelease_ready != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 300
 
@@ -429,6 +451,8 @@ jobs:
   # Job 2b: Complete the cross build — install, package and publish.
   # Restores Job 2a's ccache; all already-compiled objects are cache hits so only
   # linking + cmake install remains. Runs even if Job 2a timed out.
+  # When prerelease_ready == 'true' (merge-to-main fast path), skips all compilation
+  # and downloads tarballs directly from the PR pre-release instead.
   # ───────────────────────────────────────────────────────────────────────────────
   build-cross-clang-lld:
     needs: [prepare, build-host, build-cross-llvm]
@@ -436,15 +460,18 @@ jobs:
       always() &&
       needs.prepare.result == 'success' &&
       needs.prepare.outputs.should_build == 'true' &&
-      needs.build-host.result == 'success' &&
-      needs.build-cross-llvm.result != 'skipped'
+      (
+        needs.prepare.outputs.prerelease_ready == 'true' ||
+        (needs.build-host.result == 'success' && needs.build-cross-llvm.result != 'skipped')
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     env:
-      RELEASE_TAG:      ${{ needs.prepare.outputs.release_tag }}
-      BOOTSTRAP_COMMIT: ${{ needs.prepare.outputs.bootstrap_commit }}
-      ZIG_VERSION:      ${{ needs.prepare.outputs.zig_version }}
+      RELEASE_TAG:        ${{ needs.prepare.outputs.release_tag }}
+      BOOTSTRAP_COMMIT:   ${{ needs.prepare.outputs.bootstrap_commit }}
+      ZIG_VERSION:        ${{ needs.prepare.outputs.zig_version }}
+      PRERELEASE_READY:   ${{ needs.prepare.outputs.prerelease_ready }}
       ZIG_TARGET:       powerpc-linux-musleabihf
       ZIG_CPU:          baseline
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -463,8 +490,21 @@ jobs:
             llvm-cross-powerpc32.tar.xz
           key: llvm-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
 
+      - name: Download artifacts from pre-release (fast path)
+        if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PRE_TAG="pre-$BOOTSTRAP_COMMIT"
+          gh release download "$PRE_TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern "llvm-host-zig.tar.xz" \
+            --pattern "llvm-cross-powerpc32.tar.xz"
+          echo "Downloaded pre-release artifacts from $PRE_TAG"
+          ls -lah llvm-host-zig.tar.xz llvm-cross-powerpc32.tar.xz
+
       - name: Free up runner disk space
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         run: |
           sudo rm -rf \
             /usr/share/dotnet \
@@ -483,11 +523,11 @@ jobs:
           df -h
 
       - name: Install build dependencies
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         run: sudo apt-get install -y -qq cmake ninja-build xz-utils python3 ccache
 
       - name: Restore ccache
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.CCACHE_DIR }}
@@ -500,7 +540,7 @@ jobs:
             ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-
 
       - name: Configure ccache
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         run: |
           ccache --set-config=max_size=8G
           ccache --set-config=compression=true
@@ -508,19 +548,19 @@ jobs:
           echo "ccache dir: $CCACHE_DIR"
 
       - name: Download host artifact
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         uses: actions/download-artifact@v4
         with:
           name: llvm-host-tools
 
       - name: Clone zig-bootstrap from Codeberg
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         run: |
           git clone --depth 1 https://codeberg.org/ziglang/zig-bootstrap.git bootstrap
           echo "Cloned at commit: $BOOTSTRAP_COMMIT"
 
       - name: Extract host tools into bootstrap tree
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         run: |
           mkdir -p bootstrap/out
           tar -xJf llvm-host-tools.tar.xz -C bootstrap/out
@@ -536,7 +576,7 @@ jobs:
           echo "Tools present: $(ls bootstrap/out/host/bin/ bootstrap/out/build-llvm-host/bin/)"
 
       - name: Patch for full cross build (clang + lld + install)
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         run: |
           # Skip host LLVM + host Zig stages (host zig already provided)
           python3 .github/scripts/patch-for-cross-only.py bootstrap/build
@@ -551,7 +591,7 @@ jobs:
           grep -n 'TARGETS_TO_BUILD\|COMPILER_LAUNCHER\|ENABLE_PROJECTS\|exit 0\|--target install' bootstrap/build || true
 
       - name: Build clang + lld and install (LLVM objects from ccache)
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         run: |
           echo "Target: $ZIG_TARGET  CPU: $ZIG_CPU  Bootstrap: $BOOTSTRAP_COMMIT"
           cd bootstrap
@@ -559,25 +599,25 @@ jobs:
           df -h
 
       - name: ccache stats
-        if: always() && steps.cache.outputs.cache-hit != 'true'
+        if: always() && steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         run: ccache -s
 
       - name: Save ccache
-        if: always() && steps.cache.outputs.cache-hit != 'true'
+        if: always() && steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Verify cross LLVM build
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         run: |
           CROSS_CMAKE="bootstrap/out/$ZIG_TARGET-$ZIG_CPU/lib/cmake/llvm/LLVMConfig.cmake"
           [[ ! -f "$CROSS_CMAKE" ]] && echo "ERROR: cross LLVM cmake config missing" && find bootstrap/out -maxdepth 4 | sort && exit 1
           echo "Cross LLVM: $(ls bootstrap/out/$ZIG_TARGET-$ZIG_CPU/lib/*.a 2>/dev/null | wc -l) static libs"
 
       - name: Package LLVM artifacts
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         run: |
           # Host Zig: full install layout matching cmake --target install output
           # lib/zig may be a symlink to bootstrap/zig/lib; use -L to dereference.
