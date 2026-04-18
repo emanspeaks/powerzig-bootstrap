@@ -61,6 +61,7 @@ jobs:
       bootstrap_commit:   ${{ steps.commit.outputs.bootstrap_commit }}
       zig_version:        ${{ steps.zig_version.outputs.zig_version }}
       prerelease_ready:   ${{ steps.prerelease.outputs.prerelease_ready }}
+      prerelease_tag:     ${{ steps.prerelease.outputs.prerelease_tag }}
     steps:
       - name: Get zig-bootstrap HEAD commit
         id: commit
@@ -163,19 +164,26 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BOOTSTRAP_COMMIT: ${{ steps.commit.outputs.bootstrap_commit }}
         run: |
-          PRE_TAG="pre-$BOOTSTRAP_COMMIT"
           READY=false
-          if gh release view "$PRE_TAG" --repo "${{ github.repository }}" &>/dev/null; then
-            ASSETS=$(gh release view "$PRE_TAG" --repo "${{ github.repository }}" \
+          FOUND_TAG=""
+          # Search for any pre-release tagged pre-{commit}-* with both required artifacts
+          CANDIDATES=$(gh release list --repo "${{ github.repository }}" --limit 50 \
+            --json tagName,isPrerelease \
+            --jq "[.[] | select(.isPrerelease == true) | select(.tagName | startswith(\"pre-$BOOTSTRAP_COMMIT-\")) | .tagName]")
+          for TAG in $(echo "$CANDIDATES" | jq -r '.[]'); do
+            ASSETS=$(gh release view "$TAG" --repo "${{ github.repository }}" \
               --json assets --jq '[.assets[].name]')
             HAS_HOST=$(echo "$ASSETS" | jq 'contains(["llvm-host-zig.tar.xz"])')
             HAS_CROSS=$(echo "$ASSETS" | jq 'contains(["llvm-cross-powerpc32.tar.xz"])')
             if [[ "$HAS_HOST" == "true" && "$HAS_CROSS" == "true" ]]; then
               READY=true
-              echo "Pre-release $PRE_TAG has both artifacts — skipping rebuild"
+              FOUND_TAG="$TAG"
+              echo "Pre-release $TAG has both artifacts — skipping rebuild"
+              break
             fi
-          fi
+          done
           echo "prerelease_ready=$READY" >> "$GITHUB_OUTPUT"
+          echo "prerelease_tag=$FOUND_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Get Zig version from zig-bootstrap (only when building)
         id: zig_version
@@ -472,6 +480,7 @@ jobs:
       BOOTSTRAP_COMMIT:   ${{ needs.prepare.outputs.bootstrap_commit }}
       ZIG_VERSION:        ${{ needs.prepare.outputs.zig_version }}
       PRERELEASE_READY:   ${{ needs.prepare.outputs.prerelease_ready }}
+      PRERELEASE_TAG:     ${{ needs.prepare.outputs.prerelease_tag }}
       ZIG_TARGET:       powerpc-linux-musleabihf
       ZIG_CPU:          baseline
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -495,13 +504,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PRE_TAG="pre-$BOOTSTRAP_COMMIT"
-          gh release download "$PRE_TAG" \
+          gh release download "$PRERELEASE_TAG" \
             --repo "${{ github.repository }}" \
             --pattern "llvm-host-zig.tar.xz" \
             --pattern "llvm-cross-powerpc32.tar.xz" \
             --clobber
-          echo "Downloaded pre-release artifacts from $PRE_TAG"
+          echo "Downloaded pre-release artifacts from $PRERELEASE_TAG"
           ls -lah llvm-host-zig.tar.xz llvm-cross-powerpc32.tar.xz
 
       - name: Free up runner disk space
@@ -649,16 +657,11 @@ jobs:
             --yes 2>/dev/null || true
 
       - name: Create pre-release (same-repo PR validation)
-        if: needs.prepare.outputs.should_prerelease == 'true'
+        if: needs.prepare.outputs.should_prerelease == 'true' && needs.prepare.outputs.prerelease_ready != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PRE_TAG="pre-$BOOTSTRAP_COMMIT"
-          # Skip if pre-release already exists (fast path re-run, or previous build already uploaded)
-          if gh release view "$PRE_TAG" --repo "${{ github.repository }}" &>/dev/null; then
-            echo "Pre-release $PRE_TAG already exists — skipping"
-            exit 0
-          fi
+          PRE_TAG="pre-$BOOTSTRAP_COMMIT-${{ github.run_id }}"
           RELEASE_TAG="$PRE_TAG" envsubst < .github/release-notes/llvm-template.md > /tmp/release-notes.md
           gh release create "$PRE_TAG" \
             --repo "${{ github.repository }}" \
