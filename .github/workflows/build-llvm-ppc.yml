@@ -646,7 +646,6 @@ jobs:
         run: |
           gh release delete "$RELEASE_TAG" \
             --repo "${{ github.repository }}" \
-            --cleanup-tag \
             --yes 2>/dev/null || true
 
       - name: Create pre-release (same-repo PR validation)
@@ -660,8 +659,9 @@ jobs:
             echo "Pre-release $PRE_TAG already has correct artifacts — skipping re-creation"
             exit 0
           fi
-          # Delete any existing pre-release for this commit (safe re-run)
-          gh release delete "$PRE_TAG" --repo "${{ github.repository }}" --cleanup-tag --yes 2>/dev/null || true
+          # Delete any existing pre-release for this commit — keep the tag (tag immutability rules
+          # prevent recreation of a deleted tag, but gh release create reuses an existing tag fine)
+          gh release delete "$PRE_TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
           RELEASE_TAG="$PRE_TAG" envsubst < .github/release-notes/llvm-template.md > /tmp/release-notes.md
           gh release create "$PRE_TAG" \
             --repo "${{ github.repository }}" \
@@ -684,7 +684,7 @@ jobs:
             --notes-file /tmp/release-notes.md \
             llvm-host-zig.tar.xz \
             llvm-cross-powerpc32.tar.xz
-          # Clean up any PR pre-release for this bootstrap commit
+          # Clean up PR pre-release for this bootstrap commit — keep the tag (see above)
           PRE_TAG="pre-$BOOTSTRAP_COMMIT"
-          gh release delete "$PRE_TAG" --repo "${{ github.repository }}" --cleanup-tag --yes 2>/dev/null || true
+          gh release delete "$PRE_TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
           echo "Full release created: $RELEASE_TAG"
