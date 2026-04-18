@@ -654,14 +654,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PRE_TAG="pre-$BOOTSTRAP_COMMIT"
-          # Fast path: pre-release already has correct artifacts — don't recreate (tag may be immutable)
-          if [[ "$PRERELEASE_READY" == "true" ]]; then
-            echo "Pre-release $PRE_TAG already has correct artifacts — skipping re-creation"
+          # Skip if pre-release already exists (fast path re-run, or previous build already uploaded)
+          if gh release view "$PRE_TAG" --repo "${{ github.repository }}" &>/dev/null; then
+            echo "Pre-release $PRE_TAG already exists — skipping"
             exit 0
           fi
-          # Delete any existing pre-release for this commit — keep the tag (tag immutability rules
-          # prevent recreation of a deleted tag, but gh release create reuses an existing tag fine)
-          gh release delete "$PRE_TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
           RELEASE_TAG="$PRE_TAG" envsubst < .github/release-notes/llvm-template.md > /tmp/release-notes.md
           gh release create "$PRE_TAG" \
             --repo "${{ github.repository }}" \
@@ -684,7 +681,4 @@ jobs:
             --notes-file /tmp/release-notes.md \
             llvm-host-zig.tar.xz \
             llvm-cross-powerpc32.tar.xz
-          # Clean up PR pre-release for this bootstrap commit — keep the tag (see above)
-          PRE_TAG="pre-$BOOTSTRAP_COMMIT"
-          gh release delete "$PRE_TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
           echo "Full release created: $RELEASE_TAG"
