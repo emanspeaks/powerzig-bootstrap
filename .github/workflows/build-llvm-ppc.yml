@@ -499,7 +499,8 @@ jobs:
           gh release download "$PRE_TAG" \
             --repo "${{ github.repository }}" \
             --pattern "llvm-host-zig.tar.xz" \
-            --pattern "llvm-cross-powerpc32.tar.xz"
+            --pattern "llvm-cross-powerpc32.tar.xz" \
+            --clobber
           echo "Downloaded pre-release artifacts from $PRE_TAG"
           ls -lah llvm-host-zig.tar.xz llvm-cross-powerpc32.tar.xz
 
