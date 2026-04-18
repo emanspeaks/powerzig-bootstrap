@@ -23,6 +23,7 @@ name: Build LLVM for PowerPC 32-bit
 
 on:
   push:
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -53,34 +54,25 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      release_tag:      ${{ steps.tag.outputs.release_tag }}
+      release_tag:       ${{ steps.tag.outputs.release_tag }}
       should_build:      ${{ steps.gate.outputs.should_build }}
       should_release:    ${{ steps.gate.outputs.should_release }}
       should_prerelease: ${{ steps.gate.outputs.should_prerelease }}
-      bootstrap_commit:  ${{ steps.clone.outputs.bootstrap_commit }}
-      zig_version:      ${{ steps.clone.outputs.zig_version }}
+      bootstrap_commit:  ${{ steps.commit.outputs.bootstrap_commit }}
+      zig_version:       ${{ steps.zig_version.outputs.zig_version }}
     steps:
-      - name: Clone zig-bootstrap from Codeberg
-        id: clone
+      - name: Get zig-bootstrap HEAD commit
+        id: commit
         run: |
-          git clone --depth 1 https://codeberg.org/ziglang/zig-bootstrap.git bootstrap
-          COMMIT=$(git -C bootstrap rev-parse --short HEAD)
+          COMMIT=$(git ls-remote https://codeberg.org/ziglang/zig-bootstrap.git HEAD | cut -c1-7)
           echo "bootstrap_commit=$COMMIT" >> "$GITHUB_OUTPUT"
-          echo "Cloned zig-bootstrap at commit: $COMMIT"
-          cd bootstrap
-          if [[ -f zig-version ]]; then
-            ZV=$(tr -d '[:space:]' < zig-version)
-          else
-            ZV=$(grep -m1 'ZIG_VERSION' build | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^" [:space:]]*' || echo "unknown")
-          fi
-          echo "zig_version=$ZV" >> "$GITHUB_OUTPUT"
-          echo "Zig version: $ZV"
+          echo "Bootstrap commit: $COMMIT"
 
       - name: Determine if build and release are needed
         id: gate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BOOTSTRAP_COMMIT: ${{ steps.clone.outputs.bootstrap_commit }}
+          BOOTSTRAP_COMMIT: ${{ steps.commit.outputs.bootstrap_commit }}
         run: |
           EVENT="${{ github.event_name }}"
           REF="${{ github.ref }}"
@@ -162,6 +154,20 @@ jobs:
           fi
           echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Release tag: $TAG"
+
+      - name: Get Zig version from zig-bootstrap (only when building)
+        id: zig_version
+        if: steps.gate.outputs.should_build == 'true'
+        run: |
+          git clone --depth 1 https://codeberg.org/ziglang/zig-bootstrap.git bootstrap-meta
+          if [[ -f bootstrap-meta/zig-version ]]; then
+            ZV=$(tr -d '[:space:]' < bootstrap-meta/zig-version)
+          else
+            ZV=$(grep -m1 'ZIG_VERSION' bootstrap-meta/build | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^" [:space:]]*' || echo "unknown")
+          fi
+          echo "zig_version=$ZV" >> "$GITHUB_OUTPUT"
+          echo "Zig version: $ZV"
+          rm -rf bootstrap-meta
 
   # ───────────────────────────────────────────────────────────────────────────────
   # Job 1: Build host LLVM + host Zig
