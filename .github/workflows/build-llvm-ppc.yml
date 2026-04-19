@@ -327,7 +327,7 @@ jobs:
     needs: [prepare, build-host]
     if: needs.prepare.outputs.should_build == 'true' && needs.prepare.outputs.prerelease_ready != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 360
 
     env:
       RELEASE_TAG:      ${{ needs.prepare.outputs.release_tag }}
@@ -387,7 +387,7 @@ jobs:
       - name: Configure ccache
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          ccache --set-config=max_size=8G
+          ccache --set-config=max_size=15G
           ccache --set-config=compression=true
           ccache -z
           echo "ccache dir: $CCACHE_DIR"
@@ -419,15 +419,13 @@ jobs:
           ln -s "$(pwd)/bootstrap/zig/lib" bootstrap/out/host/lib/zig
           echo "Host Zig: $(bootstrap/out/host/bin/zig version)"
 
-      - name: Patch for compile-only cross build
+      - name: Patch for compile-only cross build (all LLVM targets)
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           # Skip host LLVM + host Zig stages (host zig already provided)
           python3 .github/scripts/patch-for-cross-only.py bootstrap/build
-          # Limit cross LLVM to PowerPC target only
-          sed -i 's/-DLLD_BUILD_TOOLS=OFF/-DLLD_BUILD_TOOLS=OFF \\\n    -DLLVM_TARGETS_TO_BUILD=PowerPC/' bootstrap/build
-          # Wire ccache into the cross LLVM cmake so compiled objects survive the job boundary
-          sed -i '/# Rebuild LLVM with Zig/,/cmake --build/{s/-DLLVM_TARGETS_TO_BUILD=PowerPC/-DLLVM_TARGETS_TO_BUILD=PowerPC \\\n    -DCMAKE_C_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_ASM_COMPILER_LAUNCHER=ccache/}' bootstrap/build
+          # Build all 20 LLVM targets and wire ccache for cross-job object reuse
+          python3 .github/scripts/patch-for-all-targets.py --ccache bootstrap/build
           # Compile-only: strip --target install from cross LLVM ONLY (not from cross zlib,
           # which must install its headers/libs so the cross LLVM cmake can find them).
           sed -i '/# Rebuild LLVM with Zig/,/cmake --build \./{s/cmake --build \. --target install/cmake --build ./}' bootstrap/build
@@ -551,7 +549,7 @@ jobs:
       - name: Configure ccache
         if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         run: |
-          ccache --set-config=max_size=8G
+          ccache --set-config=max_size=15G
           ccache --set-config=compression=true
           ccache -z
           echo "ccache dir: $CCACHE_DIR"
@@ -584,15 +582,13 @@ jobs:
           echo "Host Zig: $(bootstrap/out/host/bin/zig version)"
           echo "Tools present: $(ls bootstrap/out/host/bin/ bootstrap/out/build-llvm-host/bin/)"
 
-      - name: Patch for full cross build (clang + lld + install)
+      - name: Patch for full cross build (all LLVM targets + clang + lld + install)
         if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         run: |
           # Skip host LLVM + host Zig stages (host zig already provided)
           python3 .github/scripts/patch-for-cross-only.py bootstrap/build
-          # Limit cross LLVM to PowerPC target only
-          sed -i 's/-DLLD_BUILD_TOOLS=OFF/-DLLD_BUILD_TOOLS=OFF \\\n    -DLLVM_TARGETS_TO_BUILD=PowerPC/' bootstrap/build
-          # Wire ccache — LLVM objects from Job 2a are cache hits; only clang+lld are new
-          sed -i '/# Rebuild LLVM with Zig/,/cmake --build/{s/-DLLVM_TARGETS_TO_BUILD=PowerPC/-DLLVM_TARGETS_TO_BUILD=PowerPC \\\n    -DCMAKE_C_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_ASM_COMPILER_LAUNCHER=ccache/}' bootstrap/build
+          # Build all 20 LLVM targets; wire ccache — most objects are cache hits from Job 2a
+          python3 .github/scripts/patch-for-all-targets.py --ccache bootstrap/build
           # Note: LLVM_ENABLE_PROJECTS is kept as-is (clang + lld); do NOT strip --target install.
           # Stop before cross Zig (we build Zig separately in powerzig repo)
           sed -i '/# Finally, we can cross compile Zig itself/a exit 0' bootstrap/build
