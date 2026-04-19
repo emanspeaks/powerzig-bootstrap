@@ -166,10 +166,10 @@ jobs:
         run: |
           READY=false
           FOUND_TAG=""
-          # Search for any pre-release tagged pre-{commit}-* with both required artifacts
+          # Search for pre-releases tagged pre-all-targets-{commit}-* with both required artifacts
           CANDIDATES=$(gh release list --repo "${{ github.repository }}" --limit 50 \
             --json tagName,isPrerelease \
-            --jq "[.[] | select(.isPrerelease == true) | select(.tagName | startswith(\"pre-$BOOTSTRAP_COMMIT-\")) | .tagName]")
+            --jq "[.[] | select(.isPrerelease == true) | select(.tagName | startswith(\"pre-all-targets-$BOOTSTRAP_COMMIT-\")) | .tagName]")
           for TAG in $(echo "$CANDIDATES" | jq -r '.[]'); do
             ASSETS=$(gh release view "$TAG" --repo "${{ github.repository }}" \
               --json assets --jq '[.assets[].name]')
@@ -327,7 +327,7 @@ jobs:
     needs: [prepare, build-host]
     if: needs.prepare.outputs.should_build == 'true' && needs.prepare.outputs.prerelease_ready != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 360
 
     env:
       RELEASE_TAG:      ${{ needs.prepare.outputs.release_tag }}
@@ -349,7 +349,7 @@ jobs:
           path: |
             llvm-host-zig.tar.xz
             llvm-cross-powerpc32.tar.xz
-          key: llvm-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
+          key: llvm-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
 
       - name: Free up runner disk space
         if: steps.cache.outputs.cache-hit != 'true'
@@ -379,15 +379,15 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-
-            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-
+            ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-
+            ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-
 
       - name: Configure ccache
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          ccache --set-config=max_size=8G
+          ccache --set-config=max_size=15G
           ccache --set-config=compression=true
           ccache -z
           echo "ccache dir: $CCACHE_DIR"
@@ -419,15 +419,13 @@ jobs:
           ln -s "$(pwd)/bootstrap/zig/lib" bootstrap/out/host/lib/zig
           echo "Host Zig: $(bootstrap/out/host/bin/zig version)"
 
-      - name: Patch for compile-only cross build
+      - name: Patch for compile-only cross build (all LLVM targets)
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           # Skip host LLVM + host Zig stages (host zig already provided)
           python3 .github/scripts/patch-for-cross-only.py bootstrap/build
-          # Limit cross LLVM to PowerPC target only
-          sed -i 's/-DLLD_BUILD_TOOLS=OFF/-DLLD_BUILD_TOOLS=OFF \\\n    -DLLVM_TARGETS_TO_BUILD=PowerPC/' bootstrap/build
-          # Wire ccache into the cross LLVM cmake so compiled objects survive the job boundary
-          sed -i '/# Rebuild LLVM with Zig/,/cmake --build/{s/-DLLVM_TARGETS_TO_BUILD=PowerPC/-DLLVM_TARGETS_TO_BUILD=PowerPC \\\n    -DCMAKE_C_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_ASM_COMPILER_LAUNCHER=ccache/}' bootstrap/build
+          # Build all 20 LLVM targets and wire ccache for cross-job object reuse
+          python3 .github/scripts/patch-for-all-targets.py --ccache bootstrap/build
           # Compile-only: strip --target install from cross LLVM ONLY (not from cross zlib,
           # which must install its headers/libs so the cross LLVM cmake can find them).
           sed -i '/# Rebuild LLVM with Zig/,/cmake --build \./{s/cmake --build \. --target install/cmake --build ./}' bootstrap/build
@@ -453,7 +451,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
 
   # ───────────────────────────────────────────────────────────────────────────────
   # Job 2b: Complete the cross build — install, package and publish.
@@ -497,7 +495,7 @@ jobs:
           path: |
             llvm-host-zig.tar.xz
             llvm-cross-powerpc32.tar.xz
-          key: llvm-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
+          key: llvm-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
 
       - name: Download artifacts from pre-release (fast path)
         if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY == 'true'
@@ -541,17 +539,17 @@ jobs:
         with:
           path: ${{ env.CCACHE_DIR }}
           # Primary: own previous save (re-run). First fallback: Job 2a LLVM-core cache.
-          key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
-            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-
-            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-
-            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-
+            ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
+            ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-
+            ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-
+            ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-
 
       - name: Configure ccache
         if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         run: |
-          ccache --set-config=max_size=8G
+          ccache --set-config=max_size=15G
           ccache --set-config=compression=true
           ccache -z
           echo "ccache dir: $CCACHE_DIR"
@@ -584,15 +582,13 @@ jobs:
           echo "Host Zig: $(bootstrap/out/host/bin/zig version)"
           echo "Tools present: $(ls bootstrap/out/host/bin/ bootstrap/out/build-llvm-host/bin/)"
 
-      - name: Patch for full cross build (clang + lld + install)
+      - name: Patch for full cross build (all LLVM targets + clang + lld + install)
         if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
         run: |
           # Skip host LLVM + host Zig stages (host zig already provided)
           python3 .github/scripts/patch-for-cross-only.py bootstrap/build
-          # Limit cross LLVM to PowerPC target only
-          sed -i 's/-DLLD_BUILD_TOOLS=OFF/-DLLD_BUILD_TOOLS=OFF \\\n    -DLLVM_TARGETS_TO_BUILD=PowerPC/' bootstrap/build
-          # Wire ccache — LLVM objects from Job 2a are cache hits; only clang+lld are new
-          sed -i '/# Rebuild LLVM with Zig/,/cmake --build/{s/-DLLVM_TARGETS_TO_BUILD=PowerPC/-DLLVM_TARGETS_TO_BUILD=PowerPC \\\n    -DCMAKE_C_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \\\n    -DCMAKE_ASM_COMPILER_LAUNCHER=ccache/}' bootstrap/build
+          # Build all 20 LLVM targets; wire ccache — most objects are cache hits from Job 2a
+          python3 .github/scripts/patch-for-all-targets.py --ccache bootstrap/build
           # Note: LLVM_ENABLE_PROJECTS is kept as-is (clang + lld); do NOT strip --target install.
           # Stop before cross Zig (we build Zig separately in powerzig repo)
           sed -i '/# Finally, we can cross compile Zig itself/a exit 0' bootstrap/build
@@ -616,7 +612,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Verify cross LLVM build
         if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
@@ -645,7 +641,7 @@ jobs:
           path: |
             llvm-host-zig.tar.xz
             llvm-cross-powerpc32.tar.xz
-          key: llvm-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
+          key: llvm-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
 
       - name: Delete existing release (force-rebuild only)
         if: needs.prepare.outputs.should_release == 'true' && inputs.force_rebuild == 'true'
@@ -661,7 +657,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PRE_TAG="pre-$BOOTSTRAP_COMMIT-${{ github.run_id }}"
+          PRE_TAG="pre-all-targets-$BOOTSTRAP_COMMIT-${{ github.run_id }}"
           RELEASE_TAG="$PRE_TAG" envsubst < .github/release-notes/llvm-template.md > /tmp/release-notes.md
           gh release create "$PRE_TAG" \
             --repo "${{ github.repository }}" \
