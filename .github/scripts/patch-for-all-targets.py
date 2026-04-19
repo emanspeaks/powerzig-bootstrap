@@ -25,7 +25,7 @@ if ANCHOR not in text:
     print(f'ERROR: anchor "{ANCHOR}" not found in {path}', file=sys.stderr)
     sys.exit(1)
 
-targets_line = f'    -DLLVM_TARGETS_TO_BUILD={ALL_TARGETS}'
+targets_line = f'    -DLLVM_TARGETS_TO_BUILD="{ALL_TARGETS}"'
 text = text.replace(ANCHOR, f'{ANCHOR} \\\n{targets_line}', 1)
 
 if add_ccache:
