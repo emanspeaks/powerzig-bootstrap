@@ -166,10 +166,10 @@ jobs:
         run: |
           READY=false
           FOUND_TAG=""
-          # Search for any pre-release tagged pre-{commit}-* with both required artifacts
+          # Search for pre-releases tagged pre-all-targets-{commit}-* with both required artifacts
           CANDIDATES=$(gh release list --repo "${{ github.repository }}" --limit 50 \
             --json tagName,isPrerelease \
-            --jq "[.[] | select(.isPrerelease == true) | select(.tagName | startswith(\"pre-$BOOTSTRAP_COMMIT-\")) | .tagName]")
+            --jq "[.[] | select(.isPrerelease == true) | select(.tagName | startswith(\"pre-all-targets-$BOOTSTRAP_COMMIT-\")) | .tagName]")
           for TAG in $(echo "$CANDIDATES" | jq -r '.[]'); do
             ASSETS=$(gh release view "$TAG" --repo "${{ github.repository }}" \
               --json assets --jq '[.assets[].name]')
@@ -349,7 +349,7 @@ jobs:
           path: |
             llvm-host-zig.tar.xz
             llvm-cross-powerpc32.tar.xz
-          key: llvm-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
+          key: llvm-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
 
       - name: Free up runner disk space
         if: steps.cache.outputs.cache-hit != 'true'
@@ -379,10 +379,10 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-
-            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-
+            ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-
+            ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-
 
       - name: Configure ccache
         if: steps.cache.outputs.cache-hit != 'true'
@@ -451,7 +451,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
 
   # ───────────────────────────────────────────────────────────────────────────────
   # Job 2b: Complete the cross build — install, package and publish.
@@ -495,7 +495,7 @@ jobs:
           path: |
             llvm-host-zig.tar.xz
             llvm-cross-powerpc32.tar.xz
-          key: llvm-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
+          key: llvm-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
 
       - name: Download artifacts from pre-release (fast path)
         if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY == 'true'
@@ -539,12 +539,12 @@ jobs:
         with:
           path: ${{ env.CCACHE_DIR }}
           # Primary: own previous save (re-run). First fallback: Job 2a LLVM-core cache.
-          key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
-            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-
-            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-
-            ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-
+            ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-${{ github.run_id }}-${{ github.run_attempt }}
+            ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-
+            ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-llvm-
+            ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-
 
       - name: Configure ccache
         if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
@@ -612,7 +612,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-cross-ppc32-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-cross-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ needs.prepare.outputs.bootstrap_commit }}-clang-lld-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Verify cross LLVM build
         if: steps.cache.outputs.cache-hit != 'true' && env.PRERELEASE_READY != 'true'
@@ -641,7 +641,7 @@ jobs:
           path: |
             llvm-host-zig.tar.xz
             llvm-cross-powerpc32.tar.xz
-          key: llvm-ppc32-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
+          key: llvm-ppc32-all-targets-${{ env.ZIG_TARGET }}-${{ env.ZIG_CPU }}-${{ needs.prepare.outputs.bootstrap_commit }}
 
       - name: Delete existing release (force-rebuild only)
         if: needs.prepare.outputs.should_release == 'true' && inputs.force_rebuild == 'true'
@@ -657,7 +657,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PRE_TAG="pre-$BOOTSTRAP_COMMIT-${{ github.run_id }}"
+          PRE_TAG="pre-all-targets-$BOOTSTRAP_COMMIT-${{ github.run_id }}"
           RELEASE_TAG="$PRE_TAG" envsubst < .github/release-notes/llvm-template.md > /tmp/release-notes.md
           gh release create "$PRE_TAG" \
             --repo "${{ github.repository }}" \
