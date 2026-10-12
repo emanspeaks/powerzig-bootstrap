@@ -157,7 +157,7 @@ jobs:
         with:
           name: stage3
       - name: Unpack stage3
-        run: tar -xf stage3.tar -C zig-build/bin
+        run: mkdir -p zig-build/bin && tar -xf stage3.tar -C zig-build/bin
 
       - name: Restore ccache
         uses: actions/cache/restore@v4
@@ -215,7 +215,7 @@ jobs:
         with:
           name: stage3
       - name: Unpack stage3
-        run: tar -xf stage3.tar -C zig-build/bin
+        run: mkdir -p zig-build/bin && tar -xf stage3.tar -C zig-build/bin
 
       - name: Restore ccache
         uses: actions/cache/restore@v4
