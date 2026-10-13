@@ -30,7 +30,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: '0 3 * * 0'   # Sundays 03:00 UTC
+    - cron: '0 6 * * *'   # Daily 06:00 UTC
 
 permissions:
   contents: write
