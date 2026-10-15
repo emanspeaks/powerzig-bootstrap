@@ -13,7 +13,7 @@ The build itself is defined in [zig-build](https://codeberg.org/emanspeaks/zig-b
 Each release contains:
 
 | File | Contents |
-|---|---|
+| --- | --- |
 | `llvm-powerpc-linux-musleabihf-baseline.tar.xz` | Static LLVM/Clang/LLD install prefix, all 20 default targets, plus zlib and zstd |
 | `manifest.json` | Every input: zig-build commit, LLVM sources (zig-bootstrap commit), devkit version, and the `llvm_key` that identifies them |
 
